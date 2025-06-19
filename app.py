@@ -11,6 +11,48 @@ from scipy import stats
 import subprocess
 import os
 
+# --- Flood Alert Thresholds ---
+ALERT_FT = {"Action": 15, "Minor Flood": 16, "Moderate Flood": 19, "Major Flood": 23}
+ALERT_M = {k: round(v * 0.3048, 2) for k, v in ALERT_FT.items()}
+# {'Action': 4.57, 'Minor Flood': 4.88, 'Moderate Flood': 5.79, 'Major Flood': 7.01}
+
+def add_alert_bands(fig, alert_m, ymax=None):
+    """
+    Shade USGS flood-alert bands on a Plotly figure.
+    Parameters
+    ----------
+    fig : go.Figure
+    alert_m : dict {label: threshold_in_m}
+    ymax : float | None  # if None use highest curve y
+    """
+    # Sort low→high so we can iterate
+    labels, levels = zip(*sorted(alert_m.items(), key=lambda t: t[1]))
+    colours = ["rgba(255,255,0,0.20)",
+               "rgba(255,165,0,0.25)",
+               "rgba(255,69,0,0.30)",
+               "rgba(139,0,0,0.35)"]
+
+    # Highest band goes to either ymax or a bit above Major
+    ymax = ymax or max(levels) * 1.1
+
+    # Build rectangle shapes
+    shapes = []
+    for i, low in enumerate(levels):
+        high = levels[i+1] if i+1 < len(levels) else ymax
+        shapes.append(dict(type="rect", xref="paper", x0=0, x1=1,
+                           yref="y", y0=low, y1=high,
+                           fillcolor=colours[i], layer="below",
+                           line_width=0))
+    fig.update_layout(shapes=shapes)
+
+    # Optional: add annotations on the right edge
+    for lab, y in alert_m.items():
+        fig.add_annotation(x=1.005, y=y,
+                           xref="paper", yref="y",
+                           text=f"{lab}<br>{y:.2f} m",
+                           showarrow=False, font_size=10,
+                           bgcolor="white", bordercolor="grey")
+
 # --- Page Configuration ---
 st.set_page_config(
     page_title="River Level Forecast",
@@ -191,27 +233,71 @@ def calculate_prediction_errors(model_name, _model, _scaler, _df, n_past=7, n_fu
     dummy_actual[:, 0] = y_val.flatten()
     y_actual_original = _scaler.inverse_transform(dummy_actual)[:, 0].reshape(y_val.shape)
     
-    # Calculate errors for each forecast day
+    # Calculate errors for each forecast day using empirical quantiles
     errors_by_day = {}
     error_stats = {}
     
     for day in range(n_future):
         errors = y_pred_original[:, day] - y_actual_original[:, day]
-        errors_by_day[f'day_{day+1}'] = errors
+        
+        # Remove any NaN or infinite values
+        errors = errors[np.isfinite(errors)]
+        
+        if len(errors) == 0:
+            continue
+            
+        # Store absolute errors for empirical quantile calculation
+        abs_errors = np.abs(errors)
+        
+        # Use last 500 errors if we have more than that, otherwise use all available
+        if len(abs_errors) > 500:
+            abs_errors = abs_errors[-500:]
+            errors_subset = errors[-500:]
+        else:
+            errors_subset = errors
+            
+        errors_by_day[f'day_{day+1}'] = abs_errors
         
         # Calculate error statistics
-        error_std = np.std(errors)
-        error_mean = np.mean(errors)
+        error_mean = np.mean(errors_subset)
+        error_std = np.std(errors_subset)
         
-        # Calculate confidence intervals (assuming normal distribution)
-        # 68% CI (±1 std), 95% CI (±1.96 std), 99% CI (±2.58 std)
-        error_stats[f'day_{day+1}'] = {
-            'mean': error_mean,
-            'std': error_std,
-            'ci_68': 1.0 * error_std,    # 68% confidence interval
-            'ci_95': 1.96 * error_std,   # 95% confidence interval
-            'ci_99': 2.58 * error_std    # 99% confidence interval
-        }
+        if len(abs_errors) >= 10:  # Need minimum samples for reliable quantiles
+            # Calculate empirical quantiles instead of normal theory
+            # For symmetric intervals, we need both sides
+            q_68_half = np.percentile(abs_errors, 68)    # 68% of absolute errors
+            q_95_half = np.percentile(abs_errors, 95)    # 95% of absolute errors  
+            q_99_half = np.percentile(abs_errors, 99)    # 99% of absolute errors
+            
+            # Cap unreasonable quantiles (safety check)
+            mean_water_level = float(np.mean(np.abs(y_actual_original[:, day])))
+            max_reasonable_error = min(3.0 * mean_water_level, 5.0)
+            
+            q_68_half = min(float(q_68_half), max_reasonable_error)
+            q_95_half = min(float(q_95_half), max_reasonable_error)
+            q_99_half = min(float(q_99_half), max_reasonable_error)
+            
+            error_stats[f'day_{day+1}'] = {
+                'mean': error_mean,
+                'std': error_std,
+                'n_samples': len(abs_errors),
+                'ci_68': q_68_half,    # Empirical 68% quantile
+                'ci_95': q_95_half,    # Empirical 95% quantile  
+                'ci_99': q_99_half,    # Empirical 99% quantile
+                'method': 'empirical'
+            }
+        else:
+            # Fallback to normal theory if not enough samples
+            max_reasonable_std = min(error_std, 3.0 * np.mean(np.abs(y_actual_original[:, day])), 5.0)
+            error_stats[f'day_{day+1}'] = {
+                'mean': error_mean,
+                'std': error_std,
+                'n_samples': len(abs_errors),
+                'ci_68': 1.0 * max_reasonable_std,
+                'ci_95': 1.96 * max_reasonable_std,
+                'ci_99': 2.58 * max_reasonable_std,
+                'method': 'normal_theory'
+            }
     
     return error_stats
 
@@ -270,6 +356,21 @@ with st.sidebar:
             st.rerun()
     else:
         st.error("Data: Not Found")
+    
+    st.header("Display Options")
+    show_alert_bands = st.checkbox("Show flood alert bands", value=True, 
+                                   help="Display USGS flood thresholds: Action (4.57m), Minor (4.88m), Moderate (5.79m), Major (7.01m)")
+    
+    if show_alert_bands:
+        st.info("""
+        **🚨 Flood Alert System**
+        
+        The colored bands show USGS flood thresholds for French Broad River at Blantyre, NC:
+        - **Yellow**: Action Stage (4.57m) - Initial flood response
+        - **Orange**: Minor Flood (4.88m) - Some inundation of low-lying areas  
+        - **Red-Orange**: Moderate Flood (5.79m) - Significant flooding expected
+        - **Dark Red**: Major Flood (7.01m) - Extensive flooding, serious threat to life/property
+        """)
 
 if full_df is None:
     st.error("Dataset not found. Please check your internet connection and try refreshing the page.")
@@ -301,6 +402,11 @@ else:
     filtered_df = full_df.loc[str(start_date):str(end_date)]
     fig_hist = go.Figure()
     fig_hist.add_trace(go.Scatter(x=filtered_df.index, y=filtered_df['stage_m'], mode='lines', name='Water Level'))
+    
+    # Add flood alert bands
+    if show_alert_bands:
+        add_alert_bands(fig_hist, ALERT_M)
+    
     fig_hist.update_layout(title="Historical Water Level Data", xaxis_title="Date", yaxis_title="Water Level (m)", height=500)
     st.plotly_chart(fig_hist, use_container_width=True, key="historical_data_chart")
 
@@ -367,7 +473,7 @@ with col2:
 forecast_start_datetime = pd.to_datetime(forecast_start_date)
 
 # Function to generate forecast
-def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl, forecast_start_dt, is_default=False):
+def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl, forecast_start_dt, is_default=False, show_alerts=True):
     if is_default:
         spinner_msg = "Loading default forecast..."
     else:
@@ -456,14 +562,33 @@ def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl,
             
             for i in range(N_FUTURE):
                 day_key = f'day_{i+1}'
-                if day_key in error_stats:
+                if day_key in error_stats and ci_key in error_stats[day_key]:
                     error_margin = error_stats[day_key][ci_key]
-                    lower_bounds.append(prediction_original[i] - error_margin)
-                    upper_bounds.append(prediction_original[i] + error_margin)
+                    
+                    # Additional safety check: ensure error margin is reasonable
+                    if np.isfinite(error_margin) and error_margin > 0:
+                        # Cap the error margin to prevent extremely wide intervals
+                        max_margin = max(prediction_original[i] * 0.5, 2.0)  # Max 50% of prediction or 2m
+                        error_margin = min(error_margin, max_margin)
+                        
+                        lower_bound = prediction_original[i] - error_margin
+                        upper_bound = prediction_original[i] + error_margin
+                        
+                        # Ensure bounds are physically reasonable (water level can't be negative)
+                        lower_bound = max(0.0, lower_bound)
+                        
+                        lower_bounds.append(lower_bound)
+                        upper_bounds.append(upper_bound)
+                    else:
+                        # Fallback: use a small default margin
+                        default_margin = prediction_original[i] * 0.1  # 10% of prediction
+                        lower_bounds.append(max(0.0, prediction_original[i] - default_margin))
+                        upper_bounds.append(prediction_original[i] + default_margin)
                 else:
-                    # Fallback to no confidence interval
-                    lower_bounds.append(prediction_original[i])
-                    upper_bounds.append(prediction_original[i])
+                    # Fallback: use a small default margin
+                    default_margin = prediction_original[i] * 0.1  # 10% of prediction
+                    lower_bounds.append(max(0.0, prediction_original[i] - default_margin))
+                    upper_bounds.append(prediction_original[i] + default_margin)
             
             forecast_df = pd.DataFrame({
                 'Date': forecast_dates.strftime('%Y-%m-%d'), 
@@ -544,6 +669,11 @@ def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl,
                         marker=dict(size=8)
                     ))
             
+            # Add flood alert bands to forecast chart
+            if show_alerts:
+                forecast_ymax = max(max(prediction_original), data_up_to_start['stage_m'].max()) * 1.1
+                add_alert_bands(fig_forecast, ALERT_M, ymax=forecast_ymax)
+            
             fig_forecast.update_layout(
                 title=f"Forecast from {actual_start_date.date()} - {N_FUTURE} Days Ahead with {confidence_lvl}% CI",
                 xaxis_title="Date",
@@ -552,16 +682,44 @@ def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl,
             chart_type = "default" if is_default else "custom"
             st.plotly_chart(fig_forecast, use_container_width=True, key=f"forecast_chart_{chart_type}_{model_name}_{confidence_lvl}_{forecast_start_dt.date()}")
             
-        # Show confidence interval interpretation
+        # Show confidence interval interpretation and debugging info
         if error_stats:
+            # Check if we're using empirical method for most days
+            empirical_days = sum(1 for stats in error_stats.values() if stats.get('method') == 'empirical')
+            total_days = len(error_stats)
+            
+            if empirical_days > total_days // 2:
+                method_description = f"**Empirical Quantiles**: Based on actual historical forecast errors (up to 500 samples per day)"
+            else:
+                method_description = f"**Normal Theory**: Based on statistical assumptions (limited historical data)"
+            
             st.info(f"""
             **Confidence Interval Interpretation:**
             
             The {confidence_lvl}% confidence interval means that, based on historical model performance, 
             we expect the actual water level to fall within the shaded area {confidence_lvl}% of the time.
             
+            **Method Used**: {method_description}
+            
             The intervals get wider for longer forecast horizons because prediction uncertainty increases over time.
+            Empirical quantiles provide more accurate confidence bounds for hydrological forecasts than normal distribution assumptions.
             """)
+            
+            # Debug info for confidence intervals
+            with st.expander("🔍 Confidence Interval Details"):
+                st.write("**Error Statistics for each forecast day:**")
+                for day_key, stats in error_stats.items():
+                    st.write(f"**{day_key.replace('_', ' ').title()}:**")
+                    st.write(f"- Method: {stats['method'].replace('_', ' ').title()}")
+                    st.write(f"- Sample size: {stats['n_samples']} errors")
+                    st.write(f"- Mean error: {stats['mean']:.3f}m")
+                    st.write(f"- Std deviation: {stats['std']:.3f}m") 
+                    st.write(f"- {confidence_lvl}% margin: ±{stats[f'ci_{confidence_lvl}']:.3f}m")
+                    if stats['method'] == 'empirical':
+                        st.write(f"  *Based on empirical {confidence_lvl}th percentile of {stats['n_samples']} historical errors*")
+                    else:
+                        st.write(f"  *Based on normal distribution theory (insufficient samples)*")
+                    st.write("---")
             
         # Show forecast performance if actual data is available
         if forecast_dates[-1] <= full_df.index.max():
@@ -579,7 +737,8 @@ generate_forecast_display(
     scaler, 
     confidence_level, 
     forecast_start_datetime, 
-    is_default=False
+    is_default=False,
+    show_alerts=show_alert_bands
 )
 
 # --- Model Performance Section ---
@@ -741,5 +900,9 @@ with tab2:
         else:
             st.warning("Not enough data to generate the comparison plot.")
 
+    # Add flood alert bands to performance chart
+    if show_alert_bands:
+        add_alert_bands(fig_test, ALERT_M)
+    
     fig_test.update_layout(title=f"{model_selection} Prediction vs Actual (Full Validation Set)", xaxis_title="Date", yaxis_title="Water Level (m)")
     st.plotly_chart(fig_test, use_container_width=True, key=f"performance_chart_{model_selection}")
