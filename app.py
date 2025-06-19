@@ -302,7 +302,7 @@ else:
     fig_hist = go.Figure()
     fig_hist.add_trace(go.Scatter(x=filtered_df.index, y=filtered_df['stage_m'], mode='lines', name='Water Level'))
     fig_hist.update_layout(title="Historical Water Level Data", xaxis_title="Date", yaxis_title="Water Level (m)", height=500)
-    st.plotly_chart(fig_hist, use_container_width=True)
+    st.plotly_chart(fig_hist, use_container_width=True, key="historical_data_chart")
 
 # --- Model Selection ---
 st.header("Analyze a Model")
@@ -366,83 +366,89 @@ with col2:
 # Convert selected date back to datetime for processing
 forecast_start_datetime = pd.to_datetime(forecast_start_date)
 
-if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
-    with st.spinner("Generating forecast and calculating confidence intervals..."):
+# Function to generate forecast
+def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl, forecast_start_dt, is_default=False):
+    if is_default:
+        spinner_msg = "Loading default forecast..."
+    else:
+        spinner_msg = "Updating forecast..."
         
+    with st.spinner(spinner_msg):
         # Calculate prediction errors for confidence intervals
-        error_stats = calculate_prediction_errors(model_selection, model, scaler, full_df, N_PAST, N_FUTURE)
+        error_stats = calculate_prediction_errors(model_name, model_obj, scaler_obj, full_df, N_PAST, N_FUTURE)
         
         # Handle real-time forecasting - use available data up to selected date or dataset end
         dataset_end_datetime = pd.Timestamp(str(full_df.index.max())[:19])
         
-        if forecast_start_datetime <= dataset_end_datetime:
+        if forecast_start_dt <= dataset_end_datetime:
             # Forecast date is within dataset - use data up to selected date
-            data_up_to_start = full_df[full_df.index <= forecast_start_datetime]
-            actual_start_date = forecast_start_datetime
+            data_up_to_start = full_df[full_df.index <= forecast_start_dt]
+            actual_start_date = forecast_start_dt
         else:
             # Forecast date is beyond dataset - use all available data
             data_up_to_start = full_df.copy()
             actual_start_date = dataset_end_datetime
-            st.info(f"📊 **Real-time forecasting**: Selected date ({forecast_start_date}) is beyond dataset. Using most recent data ({actual_start_date.date()}) as starting point.")
+            # Always inform user when selected date is beyond available data
+            st.info(f"📊 **Data Limitation**: Selected date ({forecast_start_dt.date()}) is beyond available data. Using latest available data ({actual_start_date.date()}) as starting point instead.")
         
         if len(data_up_to_start) < N_PAST:
             st.error(f"Not enough historical data. Need at least {N_PAST} days of data before the selected date.")
-            st.stop()
+            return
         
-        if model_selection == 'XGBoost':
+        if model_name == 'XGBoost':
             # Get the last N_PAST days before the forecast start date
-            latest_data = data_up_to_start[scaler.feature_names_in_].tail(N_PAST)  # type: ignore
-            scaled_data = scaler.transform(latest_data)
+            latest_data = data_up_to_start[scaler_obj.feature_names_in_].tail(N_PAST)  # type: ignore
+            scaled_data = scaler_obj.transform(latest_data)
             X_pred = np.array([scaled_data])
             
             # Flatten the sequence for baseline XGBoost (same as MLP)
             X_pred_flat = X_pred.reshape(X_pred.shape[0], -1)
             
-            prediction_scaled = model.predict(X_pred_flat)
+            prediction_scaled = model_obj.predict(X_pred_flat)
             
             if prediction_scaled.ndim == 1:
                 prediction_scaled = prediction_scaled.reshape(1, -1)
             
-            n_features = len(scaler.feature_names_in_)
+            n_features = len(scaler_obj.feature_names_in_)
             temp_pred_array = np.zeros((prediction_scaled.shape[1], n_features))
             temp_pred_array[:, 0] = prediction_scaled[0]
-            prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
+            prediction_original = scaler_obj.inverse_transform(temp_pred_array)[:, 0]
 
-        elif model_selection == 'MLP':
+        elif model_name == 'MLP':
             # Get the last N_PAST days before the forecast start date
-            latest_data = data_up_to_start[scaler.feature_names_in_].tail(N_PAST)  # type: ignore
-            scaled_data = scaler.transform(latest_data)
+            latest_data = data_up_to_start[scaler_obj.feature_names_in_].tail(N_PAST)  # type: ignore
+            scaled_data = scaler_obj.transform(latest_data)
             X_pred = np.array([scaled_data])
             
             # Flatten the sequence for MLP (shape becomes (1, 49) for 7 timesteps * 7 features)
             X_pred_flat = X_pred.reshape(X_pred.shape[0], -1)
             
-            prediction_scaled = model.predict(X_pred_flat)
+            prediction_scaled = model_obj.predict(X_pred_flat)
             
-            n_features = len(scaler.feature_names_in_)
+            n_features = len(scaler_obj.feature_names_in_)
             temp_pred_array = np.zeros((prediction_scaled.shape[1], n_features))
             temp_pred_array[:, 0] = prediction_scaled.flatten()
-            prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
+            prediction_original = scaler_obj.inverse_transform(temp_pred_array)[:, 0]
 
         else: # LSTM
             # Get the last N_PAST days before the forecast start date
-            latest_data = data_up_to_start[scaler.feature_names_in_].tail(N_PAST)  # type: ignore
-            scaled_data = scaler.transform(latest_data)
+            latest_data = data_up_to_start[scaler_obj.feature_names_in_].tail(N_PAST)  # type: ignore
+            scaled_data = scaler_obj.transform(latest_data)
             X_pred = np.array([scaled_data])
             
-            prediction_scaled = model.predict(X_pred)
+            prediction_scaled = model_obj.predict(X_pred)
             
-            n_features = len(scaler.feature_names_in_)
+            n_features = len(scaler_obj.feature_names_in_)
             temp_pred_array = np.zeros((prediction_scaled.shape[1], n_features))
             temp_pred_array[:, 0] = prediction_scaled.flatten()
-            prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
+            prediction_original = scaler_obj.inverse_transform(temp_pred_array)[:, 0]
 
         # Generate forecast dates starting from the day after the actual start date
-        forecast_dates = pd.to_datetime(actual_start_date) + pd.to_timedelta(np.arange(1, N_FUTURE + 1), 'D')
+        forecast_dates = actual_start_date + pd.to_timedelta(np.arange(1, N_FUTURE + 1), 'D')
         
         # Calculate confidence intervals if error stats are available
         if error_stats:
-            ci_key = f'ci_{confidence_level}'
+            ci_key = f'ci_{confidence_lvl}'
             
             # Calculate upper and lower bounds for each forecast day
             lower_bounds = []
@@ -462,8 +468,8 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
             forecast_df = pd.DataFrame({
                 'Date': forecast_dates.strftime('%Y-%m-%d'), 
                 'Forecasted Water Level (m)': prediction_original.round(2),
-                f'Lower Bound ({confidence_level}% CI)': np.array(lower_bounds).round(2),
-                f'Upper Bound ({confidence_level}% CI)': np.array(upper_bounds).round(2)
+                f'Lower Bound ({confidence_lvl}% CI)': np.array(lower_bounds).round(2),
+                f'Upper Bound ({confidence_lvl}% CI)': np.array(upper_bounds).round(2)
             })
         else:
             forecast_df = pd.DataFrame({
@@ -521,7 +527,7 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
                     fill='toself',
                     fillcolor='rgba(255, 0, 0, 0.2)',
                     line=dict(color='rgba(255, 255, 255, 0)'),
-                    name=f'{confidence_level}% Confidence Interval',
+                    name=f'{confidence_lvl}% Confidence Interval',
                     showlegend=True
                 ))
             
@@ -539,19 +545,20 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
                     ))
             
             fig_forecast.update_layout(
-                title=f"Forecast from {actual_start_date.date()} - {N_FUTURE} Days Ahead with {confidence_level}% CI",
+                title=f"Forecast from {actual_start_date.date()} - {N_FUTURE} Days Ahead with {confidence_lvl}% CI",
                 xaxis_title="Date",
                 yaxis_title="Water Level (m)"
             )
-            st.plotly_chart(fig_forecast, use_container_width=True)
+            chart_type = "default" if is_default else "custom"
+            st.plotly_chart(fig_forecast, use_container_width=True, key=f"forecast_chart_{chart_type}_{model_name}_{confidence_lvl}_{forecast_start_dt.date()}")
             
         # Show confidence interval interpretation
         if error_stats:
             st.info(f"""
             **Confidence Interval Interpretation:**
             
-            The {confidence_level}% confidence interval means that, based on historical model performance, 
-            we expect the actual water level to fall within the shaded area {confidence_level}% of the time.
+            The {confidence_lvl}% confidence interval means that, based on historical model performance, 
+            we expect the actual water level to fall within the shaded area {confidence_lvl}% of the time.
             
             The intervals get wider for longer forecast horizons because prediction uncertainty increases over time.
             """)
@@ -561,6 +568,19 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
             st.success("💡 **Actual data is available for this forecast period!** You can compare the forecast accuracy above.")
         else:
             st.info("🔮 **This is a future forecast** - actual data is not yet available for comparison.")
+
+st.subheader("📈 7-Day Water Level Forecast")
+st.write("*Adjust the parameters below to see real-time forecast updates*")
+
+# Generate forecast automatically when parameters change
+generate_forecast_display(
+    model_selection, 
+    model, 
+    scaler, 
+    confidence_level, 
+    forecast_start_datetime, 
+    is_default=False
+)
 
 # --- Model Performance Section ---
 st.header("Model Performance")
@@ -722,4 +742,4 @@ with tab2:
             st.warning("Not enough data to generate the comparison plot.")
 
     fig_test.update_layout(title=f"{model_selection} Prediction vs Actual (Full Validation Set)", xaxis_title="Date", yaxis_title="Water Level (m)")
-    st.plotly_chart(fig_test, use_container_width=True)
+    st.plotly_chart(fig_test, use_container_width=True, key=f"performance_chart_{model_selection}")
