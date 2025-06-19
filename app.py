@@ -214,13 +214,39 @@ st.header("Model Predictions")
 st.subheader("Forecast Water Level")
 st.info(f"The {model_selection} model provides a {N_FUTURE}-day forecast with confidence intervals.")
 
-# Add confidence level selection
-confidence_level = st.selectbox(
-    "Select confidence level:",
-    options=[68, 95, 99],
-    index=1,  # Default to 95%
-    format_func=lambda x: f"{x}% Confidence Interval"
-)
+# Add forecast start date selection
+# Convert to python dates properly for date input widget
+min_date_str = str(full_df.index.min())[:10]
+max_date_str = str(full_df.index.max())[:10]
+min_date = datetime.strptime(min_date_str, '%Y-%m-%d').date()
+max_date = datetime.strptime(max_date_str, '%Y-%m-%d').date()
+
+# Need N_PAST days of history, so earliest forecast date is min_date + N_PAST days
+import datetime as dt
+earliest_forecast_date = min_date + dt.timedelta(days=N_PAST)
+
+col1, col2 = st.columns(2)
+with col1:
+    # Add confidence level selection
+    confidence_level = st.selectbox(
+        "Select confidence level:",
+        options=[68, 95, 99],
+        index=1,  # Default to 95%
+        format_func=lambda x: f"{x}% Confidence Interval"
+    )
+
+with col2:
+    # Add forecast start date selection
+    forecast_start_date = st.date_input(
+        "Select forecast start date:",
+        value=max_date,
+        min_value=earliest_forecast_date,
+        max_value=max_date,
+        help=f"Choose any date from {earliest_forecast_date} to {max_date}"
+    )
+
+# Convert selected date back to datetime for processing
+forecast_start_datetime = pd.to_datetime(forecast_start_date)
 
 if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
     with st.spinner("Generating forecast and calculating confidence intervals..."):
@@ -228,9 +254,16 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
         # Calculate prediction errors for confidence intervals
         error_stats = calculate_prediction_errors(model_selection, model, scaler, full_df, N_PAST, N_FUTURE)
         
+        # Get the data up to the selected forecast start date
+        data_up_to_start = full_df[full_df.index <= forecast_start_datetime]
+        
+        if len(data_up_to_start) < N_PAST:
+            st.error(f"Not enough historical data. Need at least {N_PAST} days of data before the selected date.")
+            st.stop()
+        
         if model_selection == 'XGBoost':
-            # Baseline XGBoost uses the same sequence approach as MLP/LSTM, but flattened
-            latest_data = full_df[scaler.feature_names_in_].tail(N_PAST)
+            # Get the last N_PAST days before the forecast start date
+            latest_data = data_up_to_start[scaler.feature_names_in_].tail(N_PAST)  # type: ignore
             scaled_data = scaler.transform(latest_data)
             X_pred = np.array([scaled_data])
             
@@ -248,8 +281,8 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
             prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
 
         elif model_selection == 'MLP':
-            # MLP expects flattened input
-            latest_data = full_df[scaler.feature_names_in_].tail(N_PAST)
+            # Get the last N_PAST days before the forecast start date
+            latest_data = data_up_to_start[scaler.feature_names_in_].tail(N_PAST)  # type: ignore
             scaled_data = scaler.transform(latest_data)
             X_pred = np.array([scaled_data])
             
@@ -264,8 +297,8 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
             prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
 
         else: # LSTM
-            # LSTM expects 3D input
-            latest_data = full_df[scaler.feature_names_in_].tail(N_PAST)
+            # Get the last N_PAST days before the forecast start date
+            latest_data = data_up_to_start[scaler.feature_names_in_].tail(N_PAST)  # type: ignore
             scaled_data = scaler.transform(latest_data)
             X_pred = np.array([scaled_data])
             
@@ -276,7 +309,8 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
             temp_pred_array[:, 0] = prediction_scaled.flatten()
             prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
 
-        forecast_dates = pd.to_datetime(full_df.index[-1]) + pd.to_timedelta(np.arange(1, N_FUTURE + 1), 'D')
+        # Generate forecast dates starting from the day after the selected start date
+        forecast_dates = pd.to_datetime(forecast_start_datetime) + pd.to_timedelta(np.arange(1, N_FUTURE + 1), 'D')
         
         # Calculate confidence intervals if error stats are available
         if error_stats:
@@ -313,17 +347,32 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
         col1, col2 = st.columns([1, 2])
         with col1:
             st.write(f"{N_FUTURE}-Day Forecast:")
+            st.write(f"Starting from: **{forecast_start_date}**")
             st.dataframe(forecast_df, use_container_width=True, hide_index=True)
         with col2:
             fig_forecast = go.Figure()
             
+            # Historical data - show context around the forecast start date
+            context_days = 30
+            context_start = max(0, len(data_up_to_start) - context_days)
+            historical_context = data_up_to_start.iloc[context_start:]
+            
             # Historical data
             fig_forecast.add_trace(go.Scatter(
-                x=full_df.tail(30).index, 
-                y=full_df.tail(30)['stage_m'], 
+                x=historical_context.index, 
+                y=historical_context['stage_m'], 
                 mode='lines+markers', 
                 name='Historical', 
                 line=dict(color='blue')
+            ))
+            
+            # Highlight the forecast start point
+            fig_forecast.add_trace(go.Scatter(
+                x=[forecast_start_datetime], 
+                y=[data_up_to_start['stage_m'].iloc[-1]], 
+                mode='markers', 
+                name='Forecast Start', 
+                marker=dict(color='green', size=10, symbol='star')
             ))
             
             # Forecast
@@ -348,8 +397,21 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
                     showlegend=True
                 ))
             
+            # Add actual values if they exist (for past forecasts)
+            if forecast_dates[-1] <= full_df.index.max():
+                actual_future = full_df[full_df.index.isin(forecast_dates)]
+                if not actual_future.empty:
+                    fig_forecast.add_trace(go.Scatter(
+                        x=actual_future.index,
+                        y=actual_future['stage_m'],
+                        mode='lines+markers',
+                        name='Actual (for comparison)',
+                        line=dict(color='orange', width=3),
+                        marker=dict(size=8)
+                    ))
+            
             fig_forecast.update_layout(
-                title=f"Historical Data and {N_FUTURE}-Day Forecast with {confidence_level}% Confidence Interval",
+                title=f"Forecast from {forecast_start_date} - {N_FUTURE} Days Ahead with {confidence_level}% CI",
                 xaxis_title="Date",
                 yaxis_title="Water Level (m)"
             )
@@ -365,6 +427,12 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
             
             The intervals get wider for longer forecast horizons because prediction uncertainty increases over time.
             """)
+            
+        # Show forecast performance if actual data is available
+        if forecast_dates[-1] <= full_df.index.max():
+            st.success("💡 **Actual data is available for this forecast period!** You can compare the forecast accuracy above.")
+        else:
+            st.info("🔮 **This is a future forecast** - actual data is not yet available for comparison.")
 
 # --- Model Performance Section ---
 st.header("Model Performance")
