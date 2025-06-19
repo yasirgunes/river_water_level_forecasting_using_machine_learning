@@ -6,8 +6,10 @@ import joblib
 import plotly.graph_objects as go
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from keras.models import load_model as load_keras_model
-from datetime import datetime
+from datetime import datetime, date
 from scipy import stats
+import subprocess
+import os
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -15,6 +17,83 @@ st.set_page_config(
     page_icon="🌊",
     layout="wide"
 )
+
+# --- Dataset Update Functions ---
+
+def check_dataset_freshness():
+    """
+    Check if the dataset is up to date.
+    Returns: (is_current, last_date, today_date)
+    """
+    try:
+        if os.path.exists('combined_dataset.csv'):
+            df = pd.read_csv('combined_dataset.csv', parse_dates=['datetime'], index_col='datetime')
+            last_date = df.index.max().date()
+            today = date.today()
+            
+            # Dataset is current if it includes yesterday's data (accounting for USGS 1-day lag)
+            yesterday = pd.Timestamp.now().date() - pd.Timedelta(days=1)
+            is_current = last_date >= yesterday
+            
+            return is_current, last_date, today
+        else:
+            return False, None, date.today()
+    except Exception as e:
+        st.error(f"Error checking dataset: {e}")
+        return False, None, date.today()
+
+def update_dataset_if_needed():
+    """
+    Check if dataset needs updating and update if necessary.
+    Returns True if data was updated, False otherwise.
+    """
+    is_current, last_date, today = check_dataset_freshness()
+    
+    if is_current:
+        return False
+    
+    # Show update status with more informational messaging
+    if last_date:
+        st.info(f"📊 Dataset will be updated to latest available data. Current data: {last_date}")
+    else:
+        st.info("📊 No dataset found. Creating new dataset...")
+    
+    # Show progress
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    try:
+        status_text.text("🔄 Updating dataset with latest water level data...")
+        progress_bar.progress(20)
+        
+        # Run the update script
+        result = subprocess.run(['python', 'update_dataset.py'], 
+                              capture_output=True, text=True, timeout=300)
+        
+        progress_bar.progress(80)
+        
+        if result.returncode == 0:
+            progress_bar.progress(100)
+            status_text.text("✅ Dataset updated successfully!")
+            st.success("🎉 Dataset updated with latest available data!")
+            
+            # Clear cache to reload new data
+            st.cache_data.clear()
+            
+            return True
+        else:
+            st.error(f"❌ Failed to update dataset: {result.stderr}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        st.error("⏰ Dataset update timed out. Please try again later.")
+        return False
+    except Exception as e:
+        st.error(f"❌ Error updating dataset: {e}")
+        return False
+    finally:
+        progress_bar.empty()
+        status_text.empty()
 
 # --- Helper Functions ---
 
@@ -49,10 +128,16 @@ def load_models_and_scalers():
 def load_data():
     """Load the combined dataset."""
     try:
-        df = pd.read_csv('data/combined_dataset.csv', index_col='datetime', parse_dates=True)
+        # Try loading from root directory first (where update_dataset.py saves it)
+        df = pd.read_csv('combined_dataset.csv', index_col='datetime', parse_dates=True)
         return df
     except FileNotFoundError:
-        return None
+        try:
+            # Fallback to data directory
+            df = pd.read_csv('data/combined_dataset.csv', index_col='datetime', parse_dates=True)
+            return df
+        except FileNotFoundError:
+            return None
 
 @st.cache_data
 def calculate_prediction_errors(model_name, _model, _scaler, _df, n_past=7, n_future=7):
@@ -60,9 +145,15 @@ def calculate_prediction_errors(model_name, _model, _scaler, _df, n_past=7, n_fu
     Calculate historical prediction errors for confidence interval estimation.
     Returns error statistics for each forecast day.
     """
-    # Use the same validation split as in training
-    split_date = '2019-01-01'
-    val_data = _df[_df.index > split_date]
+    # Use dynamic validation split - from training start to today
+    split_date_start = '2019-01-01'  # Keep training split as is
+    today = pd.Timestamp.now().normalize()  # Get today's date at midnight
+    
+    # Use data from training split start to today (or dataset end, whichever is earlier)
+    dataset_end = pd.Timestamp(str(_df.index.max())[:19])
+    validation_end = min(today, dataset_end)
+    
+    val_data = _df[(_df.index > split_date_start) & (_df.index <= validation_end)]
     
     # Scale the validation data
     df_scaled_val = pd.DataFrame(_scaler.transform(val_data[_scaler.feature_names_in_]), 
@@ -133,16 +224,34 @@ def create_sequences(data, n_past, n_future):
         y.append(numpy_data[i + n_past : i + n_past + n_future, 0])
     return np.array(X), np.array(y)
 
-# --- Load Resources ---
+# --- Auto-Update Dataset on App Load ---
+st.title("🌊 French Broad River Water Level Prediction")
+st.write("Interactive dashboard for visualizing and predicting river water levels with confidence intervals.")
+
+# Check and update dataset if needed
+with st.spinner("🔍 Checking dataset freshness..."):
+    dataset_updated = update_dataset_if_needed()
+
+# Load resources after potential update
 models, scalers = load_models_and_scalers()
 full_df = load_data()
+
+# Show dataset status
+if full_df is not None:
+    is_current, last_date, today = check_dataset_freshness()
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("📅 Latest Data", str(last_date) if last_date else "N/A")
+    with col2:
+        st.metric("📈 Total Records", f"{len(full_df):,}")
 
 # --- Sidebar ---
 with st.sidebar:
     st.title("About")
     st.write("This dashboard visualizes river water level data and predictions.")
     st.header("Features")
-    st.markdown("- Historical data visualization\n- Water level forecasting\n- Confidence intervals\n- Model performance metrics")
+    st.markdown("- Historical data visualization\n- Water level forecasting\n- Confidence intervals\n- Model performance metrics\n- **Auto-updating dataset**")
     
     st.header("System Status")
     for model_name in ['XGBoost', 'MLP', 'LSTM']:
@@ -153,15 +262,17 @@ with st.sidebar:
 
     if full_df is not None:
         st.success("Data: Loaded")
+        
+        # Add manual update button
+        if st.button("🔄 Force Update Dataset"):
+            st.cache_data.clear()  # Clear cache first
+            update_dataset_if_needed()
+            st.rerun()
     else:
         st.error("Data: Not Found")
 
-# --- Main Application ---
-st.title("🌊 French Broad River Water Level Prediction")
-st.write("Interactive dashboard for visualizing and predicting river water levels with confidence intervals.")
-
 if full_df is None:
-    st.error("Dataset 'data/combined_dataset.csv' not found. The application cannot proceed.")
+    st.error("Dataset not found. Please check your internet connection and try refreshing the page.")
     st.stop()
 
 with st.expander("View Raw Data"):
@@ -214,15 +325,22 @@ st.header("Model Predictions")
 st.subheader("Forecast Water Level")
 st.info(f"The {model_selection} model provides a {N_FUTURE}-day forecast with confidence intervals.")
 
-# Add forecast start date selection
+# Add forecast start date selection - allow forecasting from today for real-time predictions
 # Convert to python dates properly for date input widget
 min_date_str = str(full_df.index.min())[:10]
-max_date_str = str(full_df.index.max())[:10]
+dataset_end_str = str(full_df.index.max())[:10]
 min_date = datetime.strptime(min_date_str, '%Y-%m-%d').date()
-max_date = datetime.strptime(max_date_str, '%Y-%m-%d').date()
+dataset_end_date = datetime.strptime(dataset_end_str, '%Y-%m-%d').date()
+
+# For real-time forecasting, allow selection up to today (even if beyond dataset)
+import datetime as dt
+today_date = dt.date.today()
+max_date = today_date  # Always allow forecasting from today
+
+# Default to latest available data date, but allow forecasting up to today
+default_forecast_date = min(dataset_end_date, today_date)
 
 # Need N_PAST days of history, so earliest forecast date is min_date + N_PAST days
-import datetime as dt
 earliest_forecast_date = min_date + dt.timedelta(days=N_PAST)
 
 col1, col2 = st.columns(2)
@@ -239,10 +357,10 @@ with col2:
     # Add forecast start date selection
     forecast_start_date = st.date_input(
         "Select forecast start date:",
-        value=max_date,
+        value=default_forecast_date,
         min_value=earliest_forecast_date,
         max_value=max_date,
-        help=f"Choose any date from {earliest_forecast_date} to {max_date}"
+        help=f"Choose any date from {earliest_forecast_date} to {max_date}. Defaults to latest available data ({dataset_end_date})."
     )
 
 # Convert selected date back to datetime for processing
@@ -254,8 +372,18 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
         # Calculate prediction errors for confidence intervals
         error_stats = calculate_prediction_errors(model_selection, model, scaler, full_df, N_PAST, N_FUTURE)
         
-        # Get the data up to the selected forecast start date
-        data_up_to_start = full_df[full_df.index <= forecast_start_datetime]
+        # Handle real-time forecasting - use available data up to selected date or dataset end
+        dataset_end_datetime = pd.Timestamp(str(full_df.index.max())[:19])
+        
+        if forecast_start_datetime <= dataset_end_datetime:
+            # Forecast date is within dataset - use data up to selected date
+            data_up_to_start = full_df[full_df.index <= forecast_start_datetime]
+            actual_start_date = forecast_start_datetime
+        else:
+            # Forecast date is beyond dataset - use all available data
+            data_up_to_start = full_df.copy()
+            actual_start_date = dataset_end_datetime
+            st.info(f"📊 **Real-time forecasting**: Selected date ({forecast_start_date}) is beyond dataset. Using most recent data ({actual_start_date.date()}) as starting point.")
         
         if len(data_up_to_start) < N_PAST:
             st.error(f"Not enough historical data. Need at least {N_PAST} days of data before the selected date.")
@@ -309,8 +437,8 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
             temp_pred_array[:, 0] = prediction_scaled.flatten()
             prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
 
-        # Generate forecast dates starting from the day after the selected start date
-        forecast_dates = pd.to_datetime(forecast_start_datetime) + pd.to_timedelta(np.arange(1, N_FUTURE + 1), 'D')
+        # Generate forecast dates starting from the day after the actual start date
+        forecast_dates = pd.to_datetime(actual_start_date) + pd.to_timedelta(np.arange(1, N_FUTURE + 1), 'D')
         
         # Calculate confidence intervals if error stats are available
         if error_stats:
@@ -347,7 +475,7 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
         col1, col2 = st.columns([1, 2])
         with col1:
             st.write(f"{N_FUTURE}-Day Forecast:")
-            st.write(f"Starting from: **{forecast_start_date}**")
+            st.write(f"Starting from: **{actual_start_date.date()}**")
             st.dataframe(forecast_df, use_container_width=True, hide_index=True)
         with col2:
             fig_forecast = go.Figure()
@@ -368,8 +496,8 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
             
             # Highlight the forecast start point
             fig_forecast.add_trace(go.Scatter(
-                x=[forecast_start_datetime], 
-                y=[data_up_to_start['stage_m'].iloc[-1]], 
+                x=[actual_start_date], 
+                y=[data_up_to_start['stage_m'].iloc[-1]],  # type: ignore
                 mode='markers', 
                 name='Forecast Start', 
                 marker=dict(color='green', size=10, symbol='star')
@@ -411,7 +539,7 @@ if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
                     ))
             
             fig_forecast.update_layout(
-                title=f"Forecast from {forecast_start_date} - {N_FUTURE} Days Ahead with {confidence_level}% CI",
+                title=f"Forecast from {actual_start_date.date()} - {N_FUTURE} Days Ahead with {confidence_level}% CI",
                 xaxis_title="Date",
                 yaxis_title="Water Level (m)"
             )
@@ -495,9 +623,12 @@ with tab2:
     
     fig_test = go.Figure()
     if model_selection == 'XGBoost':
-        # For baseline XGBoost, use the same validation approach as LSTM/MLP
-        split_date = '2019-01-01'
-        val_data = full_df[full_df.index > split_date]
+        # For baseline XGBoost, use dynamic validation period up to today
+        split_date_start = '2019-01-01'
+        today = pd.Timestamp.now().normalize()
+        dataset_end = pd.Timestamp(str(full_df.index.max())[:19])  # Convert to string first to avoid type issues
+        validation_end = min(today, dataset_end)
+        val_data = full_df[(full_df.index > split_date_start) & (full_df.index <= validation_end)]
         
         # Scale the validation data
         df_scaled_val = pd.DataFrame(scaler.transform(val_data[scaler.feature_names_in_]), 
@@ -537,10 +668,12 @@ with tab2:
         else:
             st.warning("Not enough data to generate the comparison plot.")
     else: # LSTM/MLP
-        # For LSTM/MLP, we need to use the entire validation set
-        # Split the data using the same date as XGBoost for consistency
-        split_date = '2019-01-01'
-        val_data = full_df[full_df.index > split_date]
+        # For LSTM/MLP, use dynamic validation period up to today
+        split_date_start = '2019-01-01'
+        today = pd.Timestamp.now().normalize()
+        dataset_end = pd.Timestamp(str(full_df.index.max())[:19])  # Convert to string first to avoid type issues
+        validation_end = min(today, dataset_end)
+        val_data = full_df[(full_df.index > split_date_start) & (full_df.index <= validation_end)]
         
         # Scale the validation data
         df_scaled_val = pd.DataFrame(scaler.transform(val_data[scaler.feature_names_in_]), 
