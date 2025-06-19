@@ -1,836 +1,524 @@
-# River Level Forecasting Dashboard
-# Advanced Water Level Prediction System
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras  # type: ignore
+import xgboost as xgb
 import joblib
 import plotly.graph_objects as go
-import plotly.express as px
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-from typing import Optional, Tuple, Dict, Any
-import warnings
-import os
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from keras.models import load_model as load_keras_model
+from datetime import datetime
+from scipy import stats
 
-# Suppress warnings for cleaner output
-warnings.filterwarnings('ignore')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-# Page Configuration
+# --- Page Configuration ---
 st.set_page_config(
-    page_title="River Level Forecasting Dashboard",
+    page_title="River Level Forecast",
     page_icon="🌊",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS for better styling
-st.markdown("""
-<style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 5px solid #1f77b4;
-    }
-    .stTab [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
-        font-size: 16px;
-        font-weight: bold;
-    }
-    .status-success {
-        color: #28a745;
-        font-weight: bold;
-    }
-    .status-error {
-        color: #dc3545;
-        font-weight: bold;
-    }
-</style>
-""", unsafe_allow_html=True)
+# --- Helper Functions ---
 
-# Initialize session state
-if 'models_loaded' not in st.session_state:
-    st.session_state.models_loaded = False
-
-# Asset Loading Functions
 @st.cache_resource
-def load_all_models() -> Dict[str, Any]:
-    """Load all forecasting models and their scalers."""
-    models = {"models": {}, "scalers": {}, "status": {}}
+def load_models_and_scalers():
+    """Load all pre-trained models and scalers."""
+    models = {}
+    scalers = {}
+    try:
+        models['XGBoost'] = joblib.load('models/best_baseline_xgboost_model.joblib')
+        scalers['XGBoost'] = joblib.load('models/multivariate_combined_scaler.joblib')
+    except Exception:
+        models['XGBoost'], scalers['XGBoost'] = None, None
     
-    # Model configurations
-    model_configs = {
-        "Multivariate LSTM": {
-            "model_file": "best_multivariate_model.keras",
-            "scaler_file": "multivariate_scaler.joblib",
-            "key": "multi_lstm"
-        },
-        "Univariate LSTM": {
-            "model_file": "best_univariate_model.keras", 
-            "scaler_file": "multivariate_scaler.joblib",  # Using multivariate scaler
-            "key": "uni_lstm"
-        },
-        "XGBoost": {
-            "model_file": "best_xgboost_model.joblib",
-            "scaler_file": "xgboost_scaler.joblib",
-            "key": "xgboost"
-        }
-    }
-    
-    for name, config in model_configs.items():
-        try:
-            if name == "XGBoost":
-                models["models"][config["key"]] = joblib.load(config["model_file"])
-            else:
-                models["models"][config["key"]] = keras.models.load_model(config["model_file"])
-            
-            models["scalers"][config["key"]] = joblib.load(config["scaler_file"])
-            models["status"][config["key"]] = "✅ Loaded"
-            
-        except FileNotFoundError:
-            models["status"][config["key"]] = "❌ File Not Found"
-        except Exception as e:
-            models["status"][config["key"]] = f"❌ Error: {str(e)[:30]}..."
-    
-    return models
+    try:
+        # MLP uses multivariate combined scaler (from baseline training)
+        models['MLP'] = load_keras_model('models/best_baseline_mlp_model.keras')
+        scalers['MLP'] = joblib.load('models/multivariate_combined_scaler.joblib')
+    except Exception:
+        models['MLP'], scalers['MLP'] = None, None
+
+    try:
+        # LSTM uses multivariate combined scaler and model
+        models['LSTM'] = load_keras_model('models/best_multivariate_combined_model.keras')
+        scalers['LSTM'] = joblib.load('models/multivariate_combined_scaler.joblib')
+    except Exception:
+        models['LSTM'], scalers['LSTM'] = None, None
+        
+    return models, scalers
 
 @st.cache_data
-def load_dataset() -> Optional[pd.DataFrame]:
-    """Load and prepare the river level dataset."""
+def load_data():
+    """Load the combined dataset."""
     try:
-        df = pd.read_csv('combined_dataset.csv', index_col='datetime', parse_dates=True)
-        if isinstance(df, pd.DataFrame):
-            df = df[['stage_m'] + [col for col in df.columns if col != 'stage_m']]
-            return df  # type: ignore
-        return None
+        df = pd.read_csv('data/combined_dataset.csv', index_col='datetime', parse_dates=True)
+        return df
     except FileNotFoundError:
         return None
-    except Exception:
-        return None
-
-# Data Processing Functions
-def create_sequences(data: np.ndarray, n_steps: int = 7) -> np.ndarray:
-    """Create time series sequences for model input."""
-    X = []
-    for i in range(n_steps, len(data)):
-        X.append(data[i-n_steps:i, :])
-    return np.array(X)
 
 @st.cache_data
-def generate_model_predictions(_model: Any, _scaler: Any, _df: pd.DataFrame, 
-                             model_type: str = "multi_lstm") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Generate predictions for validation period."""
+def calculate_prediction_errors(model_name, _model, _scaler, _df, n_past=7, n_future=7):
+    """
+    Calculate historical prediction errors for confidence interval estimation.
+    Returns error statistics for each forecast day.
+    """
+    # Use the same validation split as in training
     split_date = '2019-01-01'
-    val_df = _df[_df.index > split_date].copy()
+    val_data = _df[_df.index > split_date]
     
-    n_steps = 7
-    n_features = _df.shape[1]
+    # Scale the validation data
+    df_scaled_val = pd.DataFrame(_scaler.transform(val_data[_scaler.feature_names_in_]), 
+                                columns=_scaler.feature_names_in_, 
+                                index=val_data.index)
     
-    # Prepare data based on model type
-    if model_type == "uni_lstm":
-        target_data = _df[['stage_m']].values
-        scaled_data = _scaler.transform(_df)
-        scaled_target = scaled_data[:, 0].reshape(-1, 1)
-        X_val = create_sequences(scaled_target, n_steps)
-    elif model_type == "xgboost":
-        # For XGBoost, we need to prepare tabular data differently
-        scaled_data = _scaler.transform(_df)
-        X_sequences = create_sequences(scaled_data, n_steps)
-        # Flatten sequences for XGBoost
-        X_val = X_sequences.reshape(X_sequences.shape[0], -1)
-    else:  # multivariate LSTM
-        scaled_data = _scaler.transform(_df)
-        X_val = create_sequences(scaled_data, n_steps)
+    # Create sequences for the entire validation set
+    X_val, y_val = create_sequences(df_scaled_val, n_past, n_future)
     
-    # Generate predictions
-    if model_type == "xgboost":
-        predictions_scaled = _model.predict(X_val)
-        # Reshape for XGBoost output (should be 7 predictions per sample)
-        predictions_scaled = predictions_scaled.reshape(-1, 7)
-    else:
-        predictions_scaled = _model.predict(X_val)
+    if len(X_val) == 0:
+        return None
     
-    # Inverse scale predictions
-    total_predictions = predictions_scaled.size
-    dummy_preds = np.zeros((total_predictions, n_features))
-    dummy_preds[:, 0] = predictions_scaled.flatten()
+    # Get predictions based on model type
+    if model_name == 'XGBoost':
+        X_val_flat = X_val.reshape(X_val.shape[0], -1)
+        y_pred_scaled = _model.predict(X_val_flat)
+    elif model_name == 'MLP':
+        X_val_flat = X_val.reshape(X_val.shape[0], -1)
+        y_pred_scaled = _model.predict(X_val_flat)
+    else:  # LSTM
+        y_pred_scaled = _model.predict(X_val)
+        if y_pred_scaled.ndim == 3:
+            y_pred_scaled = y_pred_scaled.squeeze(axis=-1)
     
-    rescaled_preds = _scaler.inverse_transform(dummy_preds)
+    # Inverse transform to get original scale
+    n_features = len(_scaler.feature_names_in_)
     
-    if predictions_scaled.ndim > 1:
-        predictions_original = rescaled_preds[:, 0].reshape(predictions_scaled.shape[0], predictions_scaled.shape[1])
-    else:
-        predictions_original = rescaled_preds[:, 0]
+    # Inverse transform predictions
+    dummy_pred = np.zeros((len(y_pred_scaled.flatten()), n_features))
+    dummy_pred[:, 0] = y_pred_scaled.flatten()
+    y_pred_original = _scaler.inverse_transform(dummy_pred)[:, 0].reshape(y_pred_scaled.shape)
     
-    # Create DataFrame
-    pred_index = _df.index[n_steps:]
-    columns = [f'Day {i+1}' for i in range(7)]
+    # Inverse transform actual values
+    dummy_actual = np.zeros((len(y_val.flatten()), n_features))
+    dummy_actual[:, 0] = y_val.flatten()
+    y_actual_original = _scaler.inverse_transform(dummy_actual)[:, 0].reshape(y_val.shape)
     
-    preds_df = pd.DataFrame(predictions_original, index=pred_index, columns=columns)  # type: ignore
-    preds_df = preds_df[preds_df.index > split_date]
-    val_data_actuals = val_df[val_df.index.isin(preds_df.index)]
+    # Calculate errors for each forecast day
+    errors_by_day = {}
+    error_stats = {}
     
-    return val_data_actuals, preds_df  # type: ignore
-
-def calculate_comprehensive_metrics(y_true: pd.DataFrame, y_pred: pd.DataFrame) -> pd.DataFrame:
-    """Calculate comprehensive performance metrics for each forecast day."""
-    metrics = []
-    for day in range(y_pred.shape[1]):
-        day_col = f'Day {day+1}'
-        true_shifted = y_true['stage_m'].shift(-day)
-        common_index = y_pred.index.intersection(true_shifted.index)
+    for day in range(n_future):
+        errors = y_pred_original[:, day] - y_actual_original[:, day]
+        errors_by_day[f'day_{day+1}'] = errors
         
-        if common_index.empty:
-            continue
-            
-        pred_vals = y_pred.loc[common_index, day_col]
-        true_vals = true_shifted.loc[common_index]
+        # Calculate error statistics
+        error_std = np.std(errors)
+        error_mean = np.mean(errors)
         
-        # Remove NaN values
-        mask = ~(pd.isna(pred_vals) | pd.isna(true_vals))
-        pred_vals_clean = pred_vals[mask]
-        true_vals_clean = true_vals[mask]
-        
-        if len(pred_vals_clean) == 0:
-            continue
-        
-        # Calculate metrics
-        r2 = r2_score(true_vals_clean, pred_vals_clean)
-        mse = mean_squared_error(true_vals_clean, pred_vals_clean)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(true_vals_clean, pred_vals_clean)
-        
-        metrics.append({
-            "Forecast Day": day + 1,
-            "R²": r2,
-            "RMSE": rmse,
-            "MAE": mae,
-            "MSE": mse
-        })
-    
-    return pd.DataFrame(metrics).set_index("Forecast Day")
-
-# Main Application
-def main():
-    # Header
-    st.title("🌊 French Broad River: Advanced Water Level Forecasting System")
-    st.markdown("""
-    **Professional-grade water level prediction dashboard** featuring multiple machine learning models 
-    for accurate 7-day forecasting. Built for hydrology research and operational water management.
-    """)
-    
-    # Load assets
-    with st.spinner("🔄 Loading models and data..."):
-        assets = load_all_models()
-        df = load_dataset()
-    
-    # Check data availability
-    if df is None:
-        st.error("❌ **Dataset not found!** Please ensure `combined_dataset.csv` is in the application directory.")
-        st.stop()
-    
-    # Sidebar Status Panel
-    with st.sidebar:
-        st.header("🔧 System Status")
-        
-        model_names = {
-            "multi_lstm": "Multivariate LSTM",
-            "uni_lstm": "Univariate LSTM", 
-            "xgboost": "XGBoost"
+        # Calculate confidence intervals (assuming normal distribution)
+        # 68% CI (±1 std), 95% CI (±1.96 std), 99% CI (±2.58 std)
+        error_stats[f'day_{day+1}'] = {
+            'mean': error_mean,
+            'std': error_std,
+            'ci_68': 1.0 * error_std,    # 68% confidence interval
+            'ci_95': 1.96 * error_std,   # 95% confidence interval
+            'ci_99': 2.58 * error_std    # 99% confidence interval
         }
-        
-        for key, name in model_names.items():
-            status = assets["status"].get(key, "❌ Not Available")
-            if "✅" in status:
-                st.markdown(f"**{name}**: <span class='status-success'>{status}</span>", unsafe_allow_html=True)
-            else:
-                st.markdown(f"**{name}**: <span class='status-error'>{status}</span>", unsafe_allow_html=True)
-        
-        # Dataset info
-        st.markdown("---")
-        st.markdown(f"**Dataset**: ✅ Loaded ({len(df):,} records)")
-        # Type ignore for date handling - linter false positive
-        min_date_str = pd.to_datetime(df.index.min()).strftime('%Y-%m-%d') if pd.notnull(df.index.min()) else "Unknown"  # type: ignore
-        max_date_str = pd.to_datetime(df.index.max()).strftime('%Y-%m-%d') if pd.notnull(df.index.max()) else "Unknown"  # type: ignore
-        st.markdown(f"**Date Range**: {min_date_str} to {max_date_str}")
-        st.markdown(f"**Features**: {df.shape[1]} variables")
-        
-        # Quick stats
-        st.markdown("---")
-        st.subheader("📊 Quick Statistics")
-        st.metric("Current Level", f"{df['stage_m'].iloc[-1]:.2f} m")
-        st.metric("Average Level", f"{df['stage_m'].mean():.2f} m")
-        st.metric("Max Recorded", f"{df['stage_m'].max():.2f} m")
-        st.metric("Min Recorded", f"{df['stage_m'].min():.2f} m")
     
-    # Main Content Tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📈 Historical Data Explorer",
-        "🎯 Model Performance Comparison", 
-        "🔮 Interactive Forecasting",
-        "📋 Technical Documentation"
-    ])
+    return error_stats
+
+def create_sequences(data, n_past, n_future):
+    """Create sequences for LSTM/MLP models."""
+    X, y = [], []
+    numpy_data = data.values
+    for i in range(len(numpy_data) - n_past - n_future + 1):
+        X.append(numpy_data[i : i + n_past])
+        y.append(numpy_data[i + n_past : i + n_past + n_future, 0])
+    return np.array(X), np.array(y)
+
+# --- Load Resources ---
+models, scalers = load_models_and_scalers()
+full_df = load_data()
+
+# --- Sidebar ---
+with st.sidebar:
+    st.title("About")
+    st.write("This dashboard visualizes river water level data and predictions.")
+    st.header("Features")
+    st.markdown("- Historical data visualization\n- Water level forecasting\n- Confidence intervals\n- Model performance metrics")
     
-    # Tab 1: Historical Data Explorer
-    with tab1:
-        st.header("📈 Historical River Water Level Analysis")
-        st.markdown("""
-        Explore the complete historical dataset of French Broad River water levels. 
-        This interactive visualization allows you to examine patterns, trends, and seasonal variations.
-        """)
+    st.header("System Status")
+    for model_name in ['XGBoost', 'MLP', 'LSTM']:
+        if models.get(model_name) and scalers.get(model_name):
+            st.success(f"{model_name} Model: Loaded")
+        else:
+            st.error(f"{model_name} Model: Not Loaded")
+
+    if full_df is not None:
+        st.success("Data: Loaded")
+    else:
+        st.error("Data: Not Found")
+
+# --- Main Application ---
+st.title("🌊 French Broad River Water Level Prediction")
+st.write("Interactive dashboard for visualizing and predicting river water levels with confidence intervals.")
+
+if full_df is None:
+    st.error("Dataset 'data/combined_dataset.csv' not found. The application cannot proceed.")
+    st.stop()
+
+with st.expander("View Raw Data"):
+    st.dataframe(full_df.tail(100).style.format("{:.2f}"))
+
+# --- Historical Data Section ---
+st.header("Historical Water Level Data")
+
+if not isinstance(full_df.index, pd.DatetimeIndex):
+    st.error("The dataframe index is not a DatetimeIndex, which is required for date operations.")
+    st.stop()
+
+# Convert to python dates properly - use a safer approach
+min_date = datetime.strptime(str(full_df.index.min())[:10], '%Y-%m-%d').date()
+max_date = datetime.strptime(str(full_df.index.max())[:10], '%Y-%m-%d').date()
+
+col1, col2 = st.columns(2)
+with col1:
+    start_date = st.date_input("Start Date", min_date, min_value=min_date, max_value=max_date)
+with col2:
+    end_date = st.date_input("End Date", max_date, min_value=min_date, max_value=max_date)
+
+if start_date and end_date and start_date > end_date:
+    st.error("Error: End date must fall after start date.")
+else:
+    filtered_df = full_df.loc[str(start_date):str(end_date)]
+    fig_hist = go.Figure()
+    fig_hist.add_trace(go.Scatter(x=filtered_df.index, y=filtered_df['stage_m'], mode='lines', name='Water Level'))
+    fig_hist.update_layout(title="Historical Water Level Data", xaxis_title="Date", yaxis_title="Water Level (m)", height=500)
+    st.plotly_chart(fig_hist, use_container_width=True)
+
+# --- Model Selection ---
+st.header("Analyze a Model")
+available_models = [m for m in ['XGBoost', 'MLP', 'LSTM'] if models.get(m)]
+model_selection = st.selectbox("Select the model to analyze:", available_models)
+
+model = models.get(model_selection)
+scaler = scalers.get(model_selection)
+
+if not model or not scaler:
+    st.error(f"{model_selection} model or scaler is not loaded. Please check the files in the 'models/' directory.")
+    st.stop()
+
+# --- Model-specific Parameters ---
+N_PAST = 7  # History for LSTM/MLP
+N_FUTURE = 7 # Days to predict
+
+# --- Model Predictions Section ---
+st.header("Model Predictions")
+st.subheader("Forecast Water Level")
+st.info(f"The {model_selection} model provides a {N_FUTURE}-day forecast with confidence intervals.")
+
+# Add confidence level selection
+confidence_level = st.selectbox(
+    "Select confidence level:",
+    options=[68, 95, 99],
+    index=1,  # Default to 95%
+    format_func=lambda x: f"{x}% Confidence Interval"
+)
+
+if st.button("🚀 Generate Forecast", key=f"generate_{model_selection}"):
+    with st.spinner("Generating forecast and calculating confidence intervals..."):
         
-        # Date range selector
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            start_date = st.date_input("📅 Start Date", df.index.min().date())
-        with col2:
-            end_date = st.date_input("📅 End Date", df.index.max().date())
-        with col3:
-            show_stats = st.checkbox("Show Statistics", value=True)
+        # Calculate prediction errors for confidence intervals
+        error_stats = calculate_prediction_errors(model_selection, model, scaler, full_df, N_PAST, N_FUTURE)
         
-        # Filter data
-        mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
-        filtered_df = df[mask]
-        
-        # Create interactive plot
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=filtered_df.index,
-            y=filtered_df['stage_m'],
-            mode='lines',
-            name='Water Level',
-            line=dict(color='#1f77b4', width=1.5),
-            hovertemplate='<b>Date</b>: %{x}<br><b>Water Level</b>: %{y:.3f} m<extra></extra>'
-        ))
-        
-        fig.update_layout(
-            title="French Broad River Water Levels Over Time",
-            xaxis_title="Date",
-            yaxis_title="Water Level (meters)",
-            hovermode='x unified',
-            template="plotly_white",
-            height=500
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Statistics panel
-        if show_stats and not filtered_df.empty:
-            st.subheader("📊 Period Statistics")
-            col1, col2, col3, col4, col5 = st.columns(5)
+        if model_selection == 'XGBoost':
+            # Baseline XGBoost uses the same sequence approach as MLP/LSTM, but flattened
+            latest_data = full_df[scaler.feature_names_in_].tail(N_PAST)
+            scaled_data = scaler.transform(latest_data)
+            X_pred = np.array([scaled_data])
             
-            with col1:
-                st.metric("Mean Level", f"{filtered_df['stage_m'].mean():.3f} m")
-            with col2:
-                st.metric("Median Level", f"{filtered_df['stage_m'].median():.3f} m")
-            with col3:
-                st.metric("Std Deviation", f"{filtered_df['stage_m'].std():.3f} m")
-            with col4:
-                st.metric("Maximum", f"{filtered_df['stage_m'].max():.3f} m")
-            with col5:
-                st.metric("Minimum", f"{filtered_df['stage_m'].min():.3f} m")
+            # Flatten the sequence for baseline XGBoost (same as MLP)
+            X_pred_flat = X_pred.reshape(X_pred.shape[0], -1)
+            
+            prediction_scaled = model.predict(X_pred_flat)
+            
+            if prediction_scaled.ndim == 1:
+                prediction_scaled = prediction_scaled.reshape(1, -1)
+            
+            n_features = len(scaler.feature_names_in_)
+            temp_pred_array = np.zeros((prediction_scaled.shape[1], n_features))
+            temp_pred_array[:, 0] = prediction_scaled[0]
+            prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
+
+        elif model_selection == 'MLP':
+            # MLP expects flattened input
+            latest_data = full_df[scaler.feature_names_in_].tail(N_PAST)
+            scaled_data = scaler.transform(latest_data)
+            X_pred = np.array([scaled_data])
+            
+            # Flatten the sequence for MLP (shape becomes (1, 49) for 7 timesteps * 7 features)
+            X_pred_flat = X_pred.reshape(X_pred.shape[0], -1)
+            
+            prediction_scaled = model.predict(X_pred_flat)
+            
+            n_features = len(scaler.feature_names_in_)
+            temp_pred_array = np.zeros((prediction_scaled.shape[1], n_features))
+            temp_pred_array[:, 0] = prediction_scaled.flatten()
+            prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
+
+        else: # LSTM
+            # LSTM expects 3D input
+            latest_data = full_df[scaler.feature_names_in_].tail(N_PAST)
+            scaled_data = scaler.transform(latest_data)
+            X_pred = np.array([scaled_data])
+            
+            prediction_scaled = model.predict(X_pred)
+            
+            n_features = len(scaler.feature_names_in_)
+            temp_pred_array = np.zeros((prediction_scaled.shape[1], n_features))
+            temp_pred_array[:, 0] = prediction_scaled.flatten()
+            prediction_original = scaler.inverse_transform(temp_pred_array)[:, 0]
+
+        forecast_dates = pd.to_datetime(full_df.index[-1]) + pd.to_timedelta(np.arange(1, N_FUTURE + 1), 'D')
         
-        # Raw data viewer
-        with st.expander("🔍 View Raw Dataset"):
-            st.dataframe(filtered_df, use_container_width=True, height=400)
-    
-    # Tab 2: Model Performance Comparison
-    with tab2:
-        st.header("🎯 Advanced Model Performance Analysis")
-        st.markdown("""
-        Compare the performance of different machine learning models on unseen validation data (2019-2025).
-        Each model predicts 7 days of water levels using the previous 7 days as input.
-        """)
-        
-        # Model selector
-        available_models = {}
-        for key, status in assets["status"].items():
-            if "✅" in status:
-                model_names = {
-                    "multi_lstm": "🧠 Multivariate LSTM",
-                    "uni_lstm": "📊 Univariate LSTM",
-                    "xgboost": "🌳 XGBoost Regressor"
-                }
-                available_models[model_names[key]] = key
-        
-        if not available_models:
-            st.error("❌ No models are available for comparison. Please check the model files.")
-            return
-        
-        selected_model_name = st.selectbox(
-            "🔧 Select Model for Analysis:",
-            options=list(available_models.keys()),
-            index=0
-        )
-        model_key = available_models[selected_model_name]
-        
-        # Generate predictions
-        with st.spinner(f"🔄 Generating predictions for {selected_model_name}..."):
-            try:
-                actuals, predictions = generate_model_predictions(
-                    assets["models"][model_key], 
-                    assets["scalers"][model_key], 
-                    df, 
-                    model_key
-                )
-                
-                # Calculate metrics
-                metrics_df = calculate_comprehensive_metrics(actuals, predictions)
-                
-                # Display metrics
-                st.subheader(f"📈 Performance Metrics: {selected_model_name}")
-                
-                # Key metrics display
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    avg_r2 = metrics_df['R²'].mean()
-                    st.metric("Average R²", f"{avg_r2:.3f}", help="Coefficient of determination (higher is better)")
-                with col2:
-                    avg_rmse = metrics_df['RMSE'].mean()
-                    st.metric("Average RMSE", f"{avg_rmse:.3f} m", help="Root Mean Square Error (lower is better)")
-                with col3:
-                    avg_mae = metrics_df['MAE'].mean()
-                    st.metric("Average MAE", f"{avg_mae:.3f} m", help="Mean Absolute Error (lower is better)")
-                with col4:
-                    day1_r2 = metrics_df.loc[1, 'R²'] if 1 in metrics_df.index else 0
-                    st.metric("Day 1 R²", f"{day1_r2:.3f}", help="Next-day prediction accuracy")
-                
-                # Detailed metrics table
-                st.subheader("📋 Detailed Performance by Forecast Day")
-                st.dataframe(
-                    metrics_df.style.format({
-                        'R²': '{:.3f}',
-                        'RMSE': '{:.3f}',
-                        'MAE': '{:.3f}', 
-                        'MSE': '{:.3f}'
-                    }).highlight_max(axis=0, subset=['R²'], color='lightgreen')
-                    .highlight_min(axis=0, subset=['RMSE', 'MAE', 'MSE'], color='lightblue'),
-                    use_container_width=True
-                )
-                
-                # Visualization
-                st.subheader("📊 Predictions vs. Actual Values (Validation Set)")
-                
-                # Sample data for visualization (to avoid overcrowding)
-                sample_size = min(1000, len(predictions))
-                sample_indices = np.random.choice(len(predictions), sample_size, replace=False)
-                sample_predictions = predictions.iloc[sample_indices].sort_index()
-                sample_actuals = actuals[actuals.index.isin(sample_predictions.index)].sort_index()
-                
-                fig = go.Figure()
-                
-                # Actual values
-                fig.add_trace(go.Scatter(
-                    x=sample_actuals.index,
-                    y=sample_actuals['stage_m'],
-                    mode='lines',
-                    name='Actual Values',
-                    line=dict(color='blue', width=2),
-                    opacity=0.8
-                ))
-                
-                # Day 1 predictions
-                fig.add_trace(go.Scatter(
-                    x=sample_predictions.index,
-                    y=sample_predictions['Day 1'],
-                    mode='lines',
-                    name='Day 1 Forecast',
-                    line=dict(color='red', width=1.5, dash='dash'),
-                    opacity=0.7
-                ))
-                
-                # Day 7 predictions (if available)
-                if 'Day 7' in sample_predictions.columns:
-                    fig.add_trace(go.Scatter(
-                        x=sample_predictions.index,
-                        y=sample_predictions['Day 7'],
-                        mode='lines',
-                        name='Day 7 Forecast',
-                        line=dict(color='orange', width=1.5, dash='dot'),
-                        opacity=0.7
-                    ))
-                
-                fig.update_layout(
-                    title=f"{selected_model_name}: Forecast vs. Actual Values (Sample of {sample_size} points)",
-                    xaxis_title="Date",
-                    yaxis_title="Water Level (meters)",
-                    hovermode='x unified',
-                    template="plotly_white",
-                    height=500,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Model interpretation
-                st.subheader("🧠 Model Performance Interpretation")
-                
-                interpretation = ""
-                if avg_r2 > 0.8:
-                    interpretation += "🟢 **Excellent** overall performance with strong predictive capability.\n"
-                elif avg_r2 > 0.6:
-                    interpretation += "🟡 **Good** performance with reliable short-term predictions.\n"
+        # Calculate confidence intervals if error stats are available
+        if error_stats:
+            ci_key = f'ci_{confidence_level}'
+            
+            # Calculate upper and lower bounds for each forecast day
+            lower_bounds = []
+            upper_bounds = []
+            
+            for i in range(N_FUTURE):
+                day_key = f'day_{i+1}'
+                if day_key in error_stats:
+                    error_margin = error_stats[day_key][ci_key]
+                    lower_bounds.append(prediction_original[i] - error_margin)
+                    upper_bounds.append(prediction_original[i] + error_margin)
                 else:
-                    interpretation += "🔴 **Fair** performance - consider model improvements.\n"
-                
-                if day1_r2 > 0.85:
-                    interpretation += "🎯 **Outstanding** next-day prediction accuracy.\n"
-                elif day1_r2 > 0.7:
-                    interpretation += "✅ **Reliable** next-day forecasting capability.\n"
-                
-                st.markdown(interpretation)
-                
-            except Exception as e:
-                st.error(f"❌ Error generating predictions: {str(e)}")
-                st.info("Please check that the model files are properly formatted and accessible.")
-    
-    # Tab 3: Interactive Forecasting
-    with tab3:
-        st.header("🔮 Interactive Water Level Forecasting")
-        st.markdown("""
-        Generate real-time 7-day water level forecasts for any date in the dataset. 
-        Compare predictions with actual values when available.
-        """)
-        
-        # Check for available models
-        available_models = {k: v for k, v in assets["status"].items() if "✅" in v}
-        if not available_models:
-            st.error("❌ No models available for forecasting.")
-            return
-        
-        # Layout
+                    # Fallback to no confidence interval
+                    lower_bounds.append(prediction_original[i])
+                    upper_bounds.append(prediction_original[i])
+            
+            forecast_df = pd.DataFrame({
+                'Date': forecast_dates.strftime('%Y-%m-%d'), 
+                'Forecasted Water Level (m)': prediction_original.round(2),
+                f'Lower Bound ({confidence_level}% CI)': np.array(lower_bounds).round(2),
+                f'Upper Bound ({confidence_level}% CI)': np.array(upper_bounds).round(2)
+            })
+        else:
+            forecast_df = pd.DataFrame({
+                'Date': forecast_dates.strftime('%Y-%m-%d'), 
+                'Forecasted Water Level (m)': prediction_original.round(2)
+            })
+            lower_bounds = upper_bounds = None
+
         col1, col2 = st.columns([1, 2])
-        
         with col1:
-            st.subheader("🎛️ Forecast Configuration")
-            
-            # Model selection for forecasting
-            forecast_models = {}
-            for key in available_models.keys():
-                model_names = {
-                    "multi_lstm": "🧠 Multivariate LSTM (Recommended)",
-                    "uni_lstm": "📊 Univariate LSTM",
-                    "xgboost": "🌳 XGBoost"
-                }
-                forecast_models[model_names[key]] = key
-            
-            selected_forecast_model = st.selectbox(
-                "Select Forecasting Model:",
-                options=list(forecast_models.keys()),
-                index=0
-            )
-            forecast_model_key = forecast_models[selected_forecast_model]
-            
-            # Date selection
-            min_date = df.index.min() + pd.DateOffset(days=7)
-            max_date = df.index.max()
-            
-            selected_date = st.date_input(
-                "📅 Forecast Start Date:",
-                value=pd.to_datetime('2024-01-15').date(),
-                min_value=min_date.date(),
-                max_value=max_date.date(),
-                help="Model will use 7 days prior to this date for prediction"
-            )
-            
-            # Input data display
-            st.markdown("---")
-            st.subheader("📋 Model Input Data")
-            input_end = pd.to_datetime(selected_date) - pd.DateOffset(days=1)
-            input_start = input_end - pd.DateOffset(days=6)
-            input_df = df.loc[input_start:input_end]
-            
-            st.dataframe(
-                input_df[['stage_m']].style.format({'stage_m': '{:.3f}'}),
-                use_container_width=True
-            )
-            
-            # Generate forecast button
-            generate_forecast = st.button(
-                "🚀 Generate 7-Day Forecast", 
-                type="primary", 
-                use_container_width=True
-            )
-        
+            st.write(f"{N_FUTURE}-Day Forecast:")
+            st.dataframe(forecast_df, use_container_width=True, hide_index=True)
         with col2:
-            if generate_forecast:
-                if len(input_df) == 7:
-                    with st.spinner("🔄 Generating comprehensive forecast..."):
-                        try:
-                            # Get model and scaler
-                            model = assets['models'][forecast_model_key]
-                            scaler = assets['scalers'][forecast_model_key]
-                            
-                            # Prepare input data
-                            input_scaled = scaler.transform(input_df)
-                            
-                            if forecast_model_key == "xgboost":
-                                # XGBoost expects flattened input
-                                input_reshaped = input_scaled.flatten().reshape(1, -1)
-                                pred_scaled = model.predict(input_reshaped)
-                                pred_scaled = pred_scaled.reshape(1, 7)
-                            elif forecast_model_key == "uni_lstm":
-                                # Univariate LSTM uses only water level
-                                input_uni = input_scaled[:, 0].reshape(1, 7, 1)
-                                pred_scaled = model.predict(input_uni)
-                            else:
-                                # Multivariate LSTM
-                                input_reshaped = input_scaled.reshape(1, 7, input_df.shape[1])
-                                pred_scaled = model.predict(input_reshaped)
-                            
-                            # Inverse transform predictions
-                            dummy = np.zeros((pred_scaled.shape[1], df.shape[1]))
-                            dummy[:, 0] = pred_scaled.flatten()
-                            pred_unscaled = scaler.inverse_transform(dummy)[:, 0]
-                            
-                            # Create forecast DataFrame
-                            forecast_dates = pd.date_range(start=selected_date, periods=7)
-                            forecast_df = pd.DataFrame({
-                                'Forecast': pred_unscaled
-                            }, index=forecast_dates)
-                            
-                            # Get actual values for comparison
-                            actual_end = pd.to_datetime(selected_date) + pd.DateOffset(days=6)
-                            try:
-                                actual_df = df.loc[pd.to_datetime(selected_date):actual_end, ['stage_m']]
-                                actual_df.rename(columns={'stage_m': 'Actual'}, inplace=True)
-                            except:
-                                actual_df = pd.DataFrame({'Actual': [np.nan]*7}, index=forecast_dates)
-                            
-                            # Combine results
-                            comparison_df = forecast_df.join(actual_df)
-                            comparison_df['Error'] = comparison_df['Actual'] - comparison_df['Forecast']
-                            comparison_df['Error %'] = (comparison_df['Error'] / comparison_df['Actual'] * 100)
-                            
-                            # Display results
-                            st.subheader("📊 7-Day Forecast Results")
-                            
-                            # Summary metrics
-                            col1, col2, col3, col4 = st.columns(4)
-                            with col1:
-                                st.metric("Avg Forecast", f"{comparison_df['Forecast'].mean():.3f} m")
-                            with col2:
-                                st.metric("Max Forecast", f"{comparison_df['Forecast'].max():.3f} m")
-                            with col3:
-                                st.metric("Min Forecast", f"{comparison_df['Forecast'].min():.3f} m")
-                            with col4:
-                                trend = "📈" if comparison_df['Forecast'].iloc[-1] > comparison_df['Forecast'].iloc[0] else "📉"
-                                st.metric("Trend", trend)
-                            
-                            # Detailed table
-                            st.dataframe(
-                                comparison_df.style.format({
-                                    'Forecast': '{:.3f}',
-                                    'Actual': '{:.3f}',
-                                    'Error': '{:.3f}',
-                                    'Error %': '{:.1f}%'
-                                }),
-                                use_container_width=True
-                            )
-                            
-                            # Performance metrics (if actual data available)
-                            valid_comparison = comparison_df.dropna()
-                            if len(valid_comparison) > 0:
-                                st.subheader("🎯 Forecast Accuracy Metrics")
-                                
-                                r2 = r2_score(valid_comparison['Actual'], valid_comparison['Forecast'])
-                                rmse = np.sqrt(mean_squared_error(valid_comparison['Actual'], valid_comparison['Forecast']))
-                                mae = mean_absolute_error(valid_comparison['Actual'], valid_comparison['Forecast'])
-                                
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    st.metric("R² Score", f"{r2:.3f}")
-                                with col2:
-                                    st.metric("RMSE", f"{rmse:.3f} m")
-                                with col3:
-                                    st.metric("MAE", f"{mae:.3f} m")
-                            
-                            # Visualization
-                            st.subheader("📈 Forecast Visualization")
-                            
-                            # Historical context (last 30 days)
-                            context_start = pd.to_datetime(selected_date) - pd.DateOffset(days=30)
-                            context_data = df.loc[context_start:pd.to_datetime(selected_date)-pd.DateOffset(days=1)]
-                            
-                            fig = go.Figure()
-                            
-                            # Historical data
-                            fig.add_trace(go.Scatter(
-                                x=context_data.index,
-                                y=context_data['stage_m'],
-                                mode='lines',
-                                name='Historical (30 days)',
-                                line=dict(color='blue', width=2)
-                            ))
-                            
-                            # Forecast
-                            fig.add_trace(go.Scatter(
-                                x=comparison_df.index,
-                                y=comparison_df['Forecast'],
-                                mode='lines+markers',
-                                name='7-Day Forecast',
-                                line=dict(color='red', width=3),
-                                marker=dict(size=8)
-                            ))
-                            
-                            # Actual values (if available)
-                            if not valid_comparison.empty:
-                                fig.add_trace(go.Scatter(
-                                    x=valid_comparison.index,
-                                    y=valid_comparison['Actual'],
-                                    mode='markers',
-                                    name='Actual Values',
-                                    marker=dict(color='green', size=10, symbol='diamond')
-                                ))
-                            
-                            # Forecast start line
-                            fig.add_vline(
-                                x=pd.to_datetime(selected_date),
-                                line_dash="dash",
-                                line_color="gray",
-                                annotation_text="Forecast Start"
-                            )
-                            
-                            fig.update_layout(
-                                title=f"Water Level Forecast from {selected_date}",
-                                xaxis_title="Date",
-                                yaxis_title="Water Level (meters)",
-                                hovermode='x unified',
-                                template="plotly_white",
-                                height=500,
-                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                            )
-                            
-                            st.plotly_chart(fig, use_container_width=True)
-                            
-                        except Exception as e:
-                            st.error(f"❌ Forecast generation failed: {str(e)}")
-                else:
-                    st.error("❌ Insufficient historical data for the selected date.")
-            else:
-                st.info("👆 Configure your forecast settings and click the button to generate predictions.")
-    
-    # Tab 4: Technical Documentation
-    with tab4:
-        st.header("📋 Technical Documentation")
-        
-        doc_tabs = st.tabs(["🏗️ Model Architecture", "📊 Dataset Information", "🔧 API Reference"])
-        
-        with doc_tabs[0]:
-            st.subheader("🏗️ Model Architecture Overview")
+            fig_forecast = go.Figure()
             
-            st.markdown("""
-            ### 🧠 Multivariate LSTM
-            - **Input**: 7-day sequences of multiple meteorological variables
-            - **Architecture**: Multi-layer LSTM with dropout regularization
-            - **Output**: 7-day water level predictions
-            - **Advantages**: Captures complex temporal patterns and variable interactions
+            # Historical data
+            fig_forecast.add_trace(go.Scatter(
+                x=full_df.tail(30).index, 
+                y=full_df.tail(30)['stage_m'], 
+                mode='lines+markers', 
+                name='Historical', 
+                line=dict(color='blue')
+            ))
             
-            ### 📊 Univariate LSTM  
-            - **Input**: 7-day sequences of water level only
-            - **Architecture**: Simplified LSTM focusing on temporal patterns
-            - **Output**: 7-day water level predictions
-            - **Advantages**: Robust performance with reduced complexity
+            # Forecast
+            fig_forecast.add_trace(go.Scatter(
+                x=forecast_dates, 
+                y=prediction_original, 
+                mode='lines+markers', 
+                name='Forecast', 
+                line=dict(color='red', dash='dash')
+            ))
             
-            ### 🌳 XGBoost Regressor
-            - **Input**: Flattened 7-day feature windows
-            - **Architecture**: Gradient boosted trees with advanced regularization
-            - **Output**: 7-day water level predictions
-            - **Advantages**: Fast inference and excellent tabular data performance
-            """)
+            # Confidence interval
+            if error_stats and lower_bounds is not None and upper_bounds is not None:
+                # Add confidence interval as filled area
+                fig_forecast.add_trace(go.Scatter(
+                    x=np.concatenate([forecast_dates, forecast_dates[::-1]]),
+                    y=np.concatenate([upper_bounds, lower_bounds[::-1]]),
+                    fill='toself',
+                    fillcolor='rgba(255, 0, 0, 0.2)',
+                    line=dict(color='rgba(255, 255, 255, 0)'),
+                    name=f'{confidence_level}% Confidence Interval',
+                    showlegend=True
+                ))
             
-            # Performance comparison
-            st.subheader("⚡ Performance Characteristics")
+            fig_forecast.update_layout(
+                title=f"Historical Data and {N_FUTURE}-Day Forecast with {confidence_level}% Confidence Interval",
+                xaxis_title="Date",
+                yaxis_title="Water Level (m)"
+            )
+            st.plotly_chart(fig_forecast, use_container_width=True)
             
-            perf_data = {
-                "Model": ["Multivariate LSTM", "Univariate LSTM", "XGBoost"],
-                "Inference Speed": ["Medium", "Fast", "Very Fast"],
-                "Memory Usage": ["High", "Medium", "Low"],
-                "Day 1 Accuracy": ["Excellent", "Very Good", "Good"],
-                "Day 7 Accuracy": ["Good", "Fair", "Fair"]
-            }
+        # Show confidence interval interpretation
+        if error_stats:
+            st.info(f"""
+            **Confidence Interval Interpretation:**
             
-            st.dataframe(pd.DataFrame(perf_data), use_container_width=True)
-        
-        with doc_tabs[1]:
-            st.subheader("📊 Dataset Information")
+            The {confidence_level}% confidence interval means that, based on historical model performance, 
+            we expect the actual water level to fall within the shaded area {confidence_level}% of the time.
             
-            if df is not None:
-                st.markdown(f"""
-                ### 📈 Dataset Overview
-                - **Total Records**: {len(df):,} observations
-                - **Date Range**: {df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}
-                - **Features**: {df.shape[1]} variables
-                - **Frequency**: Hourly measurements
-                - **Training Period**: Up to 2019-01-01
-                - **Validation Period**: 2019-01-01 onwards
-                """)
-                
-                st.subheader("📋 Feature Descriptions")
-                feature_info = {
-                    "Feature": df.columns.tolist(),
-                    "Description": ["Target variable: River water stage in meters"] + 
-                                 [f"Meteorological feature {i}" for i in range(len(df.columns)-1)],
-                    "Unit": ["meters"] + ["various"] * (len(df.columns)-1)
-                }
-                
-                st.dataframe(pd.DataFrame(feature_info), use_container_width=True)
-                
-                st.subheader("📊 Data Quality Metrics")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    missing_pct = (df.isnull().sum().sum() / (len(df) * df.shape[1])) * 100
-                    st.metric("Missing Data", f"{missing_pct:.2f}%")
-                
-                with col2:
-                    duplicates = df.index.duplicated().sum()
-                    st.metric("Duplicate Timestamps", f"{duplicates}")
-                
-                with col3:
-                    outliers = len(df[np.abs(df['stage_m'] - df['stage_m'].mean()) > 3 * df['stage_m'].std()])
-                    st.metric("Potential Outliers", f"{outliers}")
-        
-        with doc_tabs[2]:
-            st.subheader("🔧 API Reference")
-            
-            st.markdown("""
-            ### 🎯 Model Prediction Interface
-            
-            ```python
-            # Load model and scaler
-            model = keras.models.load_model('best_multivariate_model.keras')
-            scaler = joblib.load('multivariate_scaler.joblib')
-            
-            # Prepare input data (7 days × features)
-            input_scaled = scaler.transform(input_data)
-            input_reshaped = input_scaled.reshape(1, 7, n_features)
-            
-            # Generate 7-day forecast
-            predictions = model.predict(input_reshaped)
-            
-            # Inverse transform to original scale
-            forecast = scaler.inverse_transform(predictions)[0]
-            ```
-            
-            ### 📊 Data Requirements
-            - **Input Shape**: (7, n_features) for multivariate models
-            - **Scaling**: All features must be scaled using the provided scaler
-            - **Temporal Order**: Data must be in chronological order
-            - **Missing Values**: No missing values allowed in input sequence
-            
-            ### 🔄 Batch Processing
-            For processing multiple forecasts efficiently:
-            
-            ```python
-            # Batch prediction example
-            batch_inputs = prepare_batch_sequences(data, window_size=7)
-            batch_predictions = model.predict(batch_inputs)
-            forecasts = inverse_transform_batch(batch_predictions, scaler)
-            ```
+            The intervals get wider for longer forecast horizons because prediction uncertainty increases over time.
             """)
 
-if __name__ == "__main__":
-    main()
+# --- Model Performance Section ---
+st.header("Model Performance")
+
+tab1, tab2 = st.tabs(["Metrics", "Test Predictions vs Actual"])
+
+with tab1:
+    st.subheader("Metrics")
+    
+    if model_selection == 'XGBoost':
+        # Use pre-computed metrics from training notebook
+        st.write("**Day-by-Day Performance (Validation Set):**")
+        
+        metrics_data = [
+            {'Day': 'Day 1', 'MAE': '0.1152 m', 'RMSE': '0.2362 m', 'R²': '0.9033'},
+            {'Day': 'Day 2', 'MAE': '0.2333 m', 'RMSE': '0.4482 m', 'R²': '0.6514'},
+            {'Day': 'Day 3', 'MAE': '0.3034 m', 'RMSE': '0.5538 m', 'R²': '0.4671'},
+            {'Day': 'Day 4', 'MAE': '0.3377 m', 'RMSE': '0.5980 m', 'R²': '0.3780'},
+            {'Day': 'Day 5', 'MAE': '0.3573 m', 'RMSE': '0.6201 m', 'R²': '0.3307'},
+            {'Day': 'Day 6', 'MAE': '0.3716 m', 'RMSE': '0.6367 m', 'R²': '0.2940'},
+            {'Day': 'Day 7', 'MAE': '0.3780 m', 'RMSE': '0.6427 m', 'R²': '0.2797'}
+        ]
+        
+        # Display metrics in a nice table
+        metrics_df = pd.DataFrame(metrics_data)
+        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+    else: # LSTM/MLP
+        # Use pre-computed metrics from training notebooks
+        st.write("**Day-by-Day Performance (Validation Set):**")
+        
+        if model_selection == 'MLP':
+            metrics_data = [
+                {'Day': 'Day 1', 'MAE': '0.1504 m', 'RMSE': '0.2873 m', 'R²': '0.8570'},
+                {'Day': 'Day 2', 'MAE': '0.2422 m', 'RMSE': '0.4543 m', 'R²': '0.6417'},
+                {'Day': 'Day 3', 'MAE': '0.3049 m', 'RMSE': '0.5549 m', 'R²': '0.4650'},
+                {'Day': 'Day 4', 'MAE': '0.3377 m', 'RMSE': '0.5991 m', 'R²': '0.3756'},
+                {'Day': 'Day 5', 'MAE': '0.3571 m', 'RMSE': '0.6250 m', 'R²': '0.3201'},
+                {'Day': 'Day 6', 'MAE': '0.3814 m', 'RMSE': '0.6465 m', 'R²': '0.2722'},
+                {'Day': 'Day 7', 'MAE': '0.3884 m', 'RMSE': '0.6550 m', 'R²': '0.2519'}
+            ]
+        else: # LSTM
+            metrics_data = [
+                {'Day': 'Day 1', 'MAE': '0.1326 m', 'RMSE': '0.2424 m', 'R²': '0.8982'},
+                {'Day': 'Day 2', 'MAE': '0.2431 m', 'RMSE': '0.4457 m', 'R²': '0.6553'},
+                {'Day': 'Day 3', 'MAE': '0.3086 m', 'RMSE': '0.5467 m', 'R²': '0.4807'},
+                {'Day': 'Day 4', 'MAE': '0.3417 m', 'RMSE': '0.5930 m', 'R²': '0.3884'},
+                {'Day': 'Day 5', 'MAE': '0.3606 m', 'RMSE': '0.6165 m', 'R²': '0.3385'},
+                {'Day': 'Day 6', 'MAE': '0.3742 m', 'RMSE': '0.6312 m', 'R²': '0.3060'},
+                {'Day': 'Day 7', 'MAE': '0.3839 m', 'RMSE': '0.6426 m', 'R²': '0.2798'}
+            ]
+        
+        # Display metrics in a nice table
+        metrics_df = pd.DataFrame(metrics_data)
+        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+with tab2:
+    st.subheader("Test set predictions vs actual values")
+    st.info("This plot shows the model's 1-day ahead predictions against the actual values for the entire validation set.")
+    
+    fig_test = go.Figure()
+    if model_selection == 'XGBoost':
+        # For baseline XGBoost, use the same validation approach as LSTM/MLP
+        split_date = '2019-01-01'
+        val_data = full_df[full_df.index > split_date]
+        
+        # Scale the validation data
+        df_scaled_val = pd.DataFrame(scaler.transform(val_data[scaler.feature_names_in_]), 
+                                    columns=scaler.feature_names_in_, 
+                                    index=val_data.index)
+        
+        # Create sequences for the entire validation set
+        X_val_xgb, y_val_xgb = create_sequences(df_scaled_val, N_PAST, N_FUTURE)
+        
+        if len(X_val_xgb) > 0:
+            # Flatten sequences for XGBoost
+            X_val_flat = X_val_xgb.reshape(X_val_xgb.shape[0], -1)
+            y_pred_val_xgb_scaled = model.predict(X_val_flat)
+            
+            # Inverse transform predictions to original scale for plotting
+            n_features = len(scaler.feature_names_in_)
+            
+            # Inverse transform predictions
+            dummy_pred = np.zeros((len(y_pred_val_xgb_scaled.flatten()), n_features))
+            dummy_pred[:, 0] = y_pred_val_xgb_scaled.flatten()
+            y_pred_val_xgb_original = scaler.inverse_transform(dummy_pred)[:, 0].reshape(y_pred_val_xgb_scaled.shape)
+            
+            # Inverse transform actual values  
+            dummy_actual = np.zeros((len(y_val_xgb.flatten()), n_features))
+            dummy_actual[:, 0] = y_val_xgb.flatten()
+            y_val_xgb_original = scaler.inverse_transform(dummy_actual)[:, 0].reshape(y_val_xgb.shape)
+            
+            # Create corresponding dates (accounting for the N_PAST offset)
+            plot_dates = df_scaled_val.index[N_PAST:N_PAST+len(y_val_xgb)]
+            
+            # Extract 1-day ahead predictions (index 0 of the 7-day forecasts)
+            actual_1day = y_val_xgb_original[:, 0]
+            predicted_1day = y_pred_val_xgb_original[:, 0]
+            
+            fig_test.add_trace(go.Scatter(x=plot_dates, y=actual_1day, mode='lines', name='Actual', line=dict(color='blue')))
+            fig_test.add_trace(go.Scatter(x=plot_dates, y=predicted_1day, mode='lines', name='Predicted', line=dict(color='red', dash='dash')))
+        else:
+            st.warning("Not enough data to generate the comparison plot.")
+    else: # LSTM/MLP
+        # For LSTM/MLP, we need to use the entire validation set
+        # Split the data using the same date as XGBoost for consistency
+        split_date = '2019-01-01'
+        val_data = full_df[full_df.index > split_date]
+        
+        # Scale the validation data
+        df_scaled_val = pd.DataFrame(scaler.transform(val_data[scaler.feature_names_in_]), 
+                                    columns=scaler.feature_names_in_, 
+                                    index=val_data.index)
+        
+        # Create sequences for the entire validation set
+        X_val_lstm, y_val_lstm = create_sequences(df_scaled_val, N_PAST, N_FUTURE)
+        
+        if len(X_val_lstm) > 0:
+            # Get predictions for the entire validation set
+            if model_selection == 'MLP':
+                # Flatten sequences for MLP
+                X_val_flat = X_val_lstm.reshape(X_val_lstm.shape[0], -1)
+                y_pred_val_lstm_scaled = model.predict(X_val_flat)
+            else: # LSTM
+                y_pred_val_lstm_scaled = model.predict(X_val_lstm)
+                # LSTM might return predictions with extra dimension, squeeze if needed
+                if y_pred_val_lstm_scaled.ndim == 3:
+                    y_pred_val_lstm_scaled = y_pred_val_lstm_scaled.squeeze(axis=-1)
+            
+            # Inverse transform predictions to original scale for plotting
+            n_features = len(scaler.feature_names_in_)
+            
+            # Inverse transform predictions
+            dummy_pred = np.zeros((len(y_pred_val_lstm_scaled.flatten()), n_features))
+            dummy_pred[:, 0] = y_pred_val_lstm_scaled.flatten()
+            y_pred_val_lstm_original = scaler.inverse_transform(dummy_pred)[:, 0].reshape(y_pred_val_lstm_scaled.shape)
+            
+            # Inverse transform actual values  
+            dummy_actual = np.zeros((len(y_val_lstm.flatten()), n_features))
+            dummy_actual[:, 0] = y_val_lstm.flatten()
+            y_val_lstm_original = scaler.inverse_transform(dummy_actual)[:, 0].reshape(y_val_lstm.shape)
+            
+            # Create corresponding dates (accounting for the N_PAST offset)
+            plot_dates = df_scaled_val.index[N_PAST:N_PAST+len(y_val_lstm)]
+            
+            # Extract 1-day ahead predictions (index 0 of the 7-day forecasts)
+            actual_1day = y_val_lstm_original[:, 0]
+            predicted_1day = y_pred_val_lstm_original[:, 0]
+            
+            fig_test.add_trace(go.Scatter(x=plot_dates, y=actual_1day, mode='lines', name='Actual', line=dict(color='blue', width=2)))
+            fig_test.add_trace(go.Scatter(x=plot_dates, y=predicted_1day, mode='lines', name='Predicted', 
+                                        line=dict(color='red', dash='dash', width=3), opacity=0.8))
+        else:
+            st.warning("Not enough data to generate the comparison plot.")
+
+    fig_test.update_layout(title=f"{model_selection} Prediction vs Actual (Full Validation Set)", xaxis_title="Date", yaxis_title="Water Level (m)")
+    st.plotly_chart(fig_test, use_container_width=True)
