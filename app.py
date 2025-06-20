@@ -5,7 +5,7 @@ import xgboost as xgb
 import joblib
 import plotly.graph_objects as go
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from keras.models import load_model as load_keras_model
+from tensorflow.keras.models import load_model as load_keras_model
 from datetime import datetime, date
 from scipy import stats
 import subprocess
