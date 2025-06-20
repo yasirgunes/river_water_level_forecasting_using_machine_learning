@@ -34,24 +34,48 @@ def add_alert_bands(fig, alert_m, ymax=None):
 
     # Highest band goes to either ymax or a bit above Major
     ymax = ymax or max(levels) * 1.1
+    
+    # Start from 0 or current y-axis minimum to make Action level more visible
+    ymin = 0
 
-    # Build rectangle shapes
+    # Build rectangle shapes - start from ymin to make Action level visible
     shapes = []
+    
+    # First band: from ymin to first threshold (Action level)
+    shapes.append(dict(type="rect", xref="paper", x0=0, x1=1,
+                       yref="y", y0=ymin, y1=levels[0],
+                       fillcolor="rgba(255,255,255,0.05)", layer="below",
+                       line_width=0))
+    
+    # Subsequent bands between thresholds
     for i, low in enumerate(levels):
         high = levels[i+1] if i+1 < len(levels) else ymax
         shapes.append(dict(type="rect", xref="paper", x0=0, x1=1,
                            yref="y", y0=low, y1=high,
                            fillcolor=colours[i], layer="below",
                            line_width=0))
+    # Add horizontal lines at each threshold for better visibility
+    for i, (label, level) in enumerate(sorted(alert_m.items(), key=lambda t: t[1])):
+        line_color = "rgba(255,215,0,0.8)" if label == "Action" else "rgba(255,255,255,0.6)"
+        line_width = 2 if label == "Action" else 1
+        shapes.append(dict(type="line", xref="paper", x0=0, x1=1,
+                           yref="y", y0=level, y1=level,
+                           line=dict(color=line_color, width=line_width)))
+    
     fig.update_layout(shapes=shapes)
 
-    # Optional: add annotations on the right edge
+    # Add annotations very close to the right edge but inside the plot area (exclude Action level)
     for lab, y in alert_m.items():
-        fig.add_annotation(x=1.005, y=y,
-                           xref="paper", yref="y",
-                           text=f"{lab}<br>{y:.2f} m",
-                           showarrow=False, font_size=10,
-                           bgcolor="white", bordercolor="grey")
+        if lab != "Action":  # Skip the Action level annotation
+            fig.add_annotation(x=0.995, y=y,
+                               xref="paper", yref="y",
+                               text=f"<b>{lab}</b><br>{y:.2f}m",
+                               showarrow=False, font_size=12,
+                               bgcolor="rgba(255,255,255,0.9)", 
+                               bordercolor="grey",
+                               borderwidth=1,
+                               xanchor="right",
+                               font_color="black")
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -405,6 +429,17 @@ else:
     
     # Add flood alert bands
     if show_alert_bands:
+        # Add Action line to legend for historical chart
+        action_level = ALERT_M["Action"]
+        fig_hist.add_trace(go.Scatter(
+            x=[filtered_df.index[0], filtered_df.index[0]],
+            y=[action_level, action_level],
+            mode='lines',
+            name=f'Action {action_level:.2f}m',
+            line=dict(color='rgba(255,215,0,1)', width=3),
+            showlegend=True,
+            visible='legendonly'
+        ))
         add_alert_bands(fig_hist, ALERT_M)
     
     fig_hist.update_layout(title="Historical Water Level Data", xaxis_title="Date", yaxis_title="Water Level (m)", height=500)
@@ -640,7 +675,12 @@ def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl,
                 y=prediction_original, 
                 mode='lines+markers', 
                 name='Forecast', 
-                line=dict(color='red', dash='dash')
+                line=dict(color='red', dash='dash'),
+                customdata=prediction_original,
+                hovertemplate='<b>%{fullData.name}</b><br>' +
+                             'Date: %{x}<br>' +
+                             'Water Level: %{y:.2f}m<br>' +
+                             '<extra></extra>'
             ))
             
             # Confidence interval
@@ -653,7 +693,8 @@ def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl,
                     fillcolor='rgba(255, 0, 0, 0.2)',
                     line=dict(color='rgba(255, 255, 255, 0)'),
                     name=f'{confidence_lvl}% Confidence Interval',
-                    showlegend=True
+                    showlegend=True,
+                    hoverinfo='skip'
                 ))
             
             # Add actual values if they exist (for past forecasts)
@@ -668,6 +709,19 @@ def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl,
                         line=dict(color='orange', width=3),
                         marker=dict(size=8)
                     ))
+            
+            # Add Action line to legend only (no visible trace on plot)
+            if show_alerts:
+                action_level = ALERT_M["Action"]
+                fig_forecast.add_trace(go.Scatter(
+                    x=[forecast_dates[0], forecast_dates[0]],  # zero-length segment
+                    y=[action_level, action_level],
+                    mode='lines',
+                    name=f'Action {action_level:.2f}m',
+                    line=dict(color='rgba(255,215,0,1)', width=3),
+                    showlegend=True,
+                    visible='legendonly'  # line is hidden, legend item shown
+                ))
             
             # Add flood alert bands to forecast chart
             if show_alerts:
@@ -900,9 +954,18 @@ with tab2:
         else:
             st.warning("Not enough data to generate the comparison plot.")
 
-    # Add flood alert bands to performance chart
-    if show_alert_bands:
-        add_alert_bands(fig_test, ALERT_M)
+    # Add Action line to legend for performance chart
+    action_level = ALERT_M["Action"]
+    x_ref = plot_dates[0] if len(plot_dates) > 0 else pd.Timestamp.now()
+    fig_test.add_trace(go.Scatter(
+        x=[x_ref, x_ref],
+        y=[action_level, action_level],
+        mode='lines',
+        name=f'Action {action_level:.2f}m',
+        line=dict(color='rgba(255,215,0,1)', width=3),
+        showlegend=True,
+        visible='legendonly'
+    ))
     
     fig_test.update_layout(title=f"{model_selection} Prediction vs Actual (Full Validation Set)", xaxis_title="Date", yaxis_title="Water Level (m)")
     st.plotly_chart(fig_test, use_container_width=True, key=f"performance_chart_{model_selection}")
