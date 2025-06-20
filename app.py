@@ -954,18 +954,5 @@ with tab2:
         else:
             st.warning("Not enough data to generate the comparison plot.")
 
-    # Add Action line to legend for performance chart
-    action_level = ALERT_M["Action"]
-    x_ref = plot_dates[0] if len(plot_dates) > 0 else pd.Timestamp.now()
-    fig_test.add_trace(go.Scatter(
-        x=[x_ref, x_ref],
-        y=[action_level, action_level],
-        mode='lines',
-        name=f'Action {action_level:.2f}m',
-        line=dict(color='rgba(255,215,0,1)', width=3),
-        showlegend=True,
-        visible='legendonly'
-    ))
-    
     fig_test.update_layout(title=f"{model_selection} Prediction vs Actual (Full Validation Set)", xaxis_title="Date", yaxis_title="Water Level (m)")
     st.plotly_chart(fig_test, use_container_width=True, key=f"performance_chart_{model_selection}")
