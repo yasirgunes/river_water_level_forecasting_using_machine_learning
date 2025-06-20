@@ -15,9 +15,11 @@ The project encompasses a full pipeline: from automated data ingestion and prepr
 
 To translate these findings into a tangible solution, the project culminates in an **interactive decision-support dashboard** built with Streamlit. This application provides live forecasts, robust confidence intervals, and visualizes predictions against official USGS flood alert levels, turning complex data into actionable insights.
 
-[![Project Demo Video](https://img.youtube.com/vi/[PLACEHOLDER_YOUTUBE_VIDEO_ID]/0.jpg)](https://www.youtube.com/watch?v=[PLACEHOLDER_YOUTUBE_VIDEO_ID])
+[![Project Demo Video](https://img.youtube.com/vi/BEHZiFkKKe0/0.jpg)](https://www.youtube.com/watch?v=BEHZiFkKKe0)
 
 > **Click the image above to watch the 90-second project trailer on YouTube.**
+
+You can test the application: https://yasirgunes-river-water-level-forecasting.streamlit.app/
 
 ---
 
