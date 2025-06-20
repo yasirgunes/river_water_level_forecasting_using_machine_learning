@@ -94,11 +94,11 @@ def check_dataset_freshness():
     try:
         if os.path.exists('combined_dataset.csv'):
             df = pd.read_csv('combined_dataset.csv', parse_dates=['datetime'], index_col='datetime')
-            last_date = df.index.max().date()
+            last_date = pd.Timestamp(df.index.max()).date()
             today = date.today()
             
             # Dataset is current if it includes yesterday's data (accounting for USGS 1-day lag)
-            yesterday = pd.Timestamp.now().date() - pd.Timedelta(days=1)
+            yesterday = (pd.Timestamp.now() - pd.Timedelta(days=1)).date()
             is_current = last_date >= yesterday
             
             return is_current, last_date, today
@@ -312,7 +312,7 @@ def calculate_prediction_errors(model_name, _model, _scaler, _df, n_past=7, n_fu
             }
         else:
             # Fallback to normal theory if not enough samples
-            max_reasonable_std = min(error_std, 3.0 * np.mean(np.abs(y_actual_original[:, day])), 5.0)
+            max_reasonable_std = min(float(error_std), 3.0 * float(np.mean(np.abs(y_actual_original[:, day]))), 5.0)
             error_stats[f'day_{day+1}'] = {
                 'mean': error_mean,
                 'std': error_std,
@@ -519,6 +519,10 @@ def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl,
         error_stats = calculate_prediction_errors(model_name, model_obj, scaler_obj, full_df, N_PAST, N_FUTURE)
         
         # Handle real-time forecasting - use available data up to selected date or dataset end
+        if full_df is None:
+            st.error("Dataset not available for forecasting.")
+            return
+            
         dataset_end_datetime = pd.Timestamp(str(full_df.index.max())[:19])
         
         if forecast_start_dt <= dataset_end_datetime:
@@ -698,7 +702,7 @@ def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl,
                 ))
             
             # Add actual values if they exist (for past forecasts)
-            if forecast_dates[-1] <= full_df.index.max():
+            if full_df is not None and forecast_dates[-1] <= full_df.index.max():
                 actual_future = full_df[full_df.index.isin(forecast_dates)]
                 if not actual_future.empty:
                     fig_forecast.add_trace(go.Scatter(
@@ -776,7 +780,7 @@ def generate_forecast_display(model_name, model_obj, scaler_obj, confidence_lvl,
                     st.write("---")
             
         # Show forecast performance if actual data is available
-        if forecast_dates[-1] <= full_df.index.max():
+        if full_df is not None and forecast_dates[-1] <= full_df.index.max():
             st.success("💡 **Actual data is available for this forecast period!** You can compare the forecast accuracy above.")
         else:
             st.info("🔮 **This is a future forecast** - actual data is not yet available for comparison.")
