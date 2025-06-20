@@ -6,8 +6,4 @@ maxMessageSize = 1024
 base = "light"
 
 [browser]
-gatherUsageStats = false
-
-# Cache settings for better performance
-[global]
-dataFrameSerialization = "legacy" 
+gatherUsageStats = false 
