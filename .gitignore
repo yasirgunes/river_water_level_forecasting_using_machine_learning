@@ -3,4 +3,3 @@ venv/*
 .cursorignore
 weather_dataset.csv
 dataset.csv
-combined_dataset.csv
