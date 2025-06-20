@@ -10,6 +10,7 @@ from datetime import datetime, date
 from scipy import stats
 import subprocess
 import os
+import sys
 
 # --- Flood Alert Thresholds ---
 ALERT_FT = {"Action": 15, "Minor Flood": 16, "Moderate Flood": 19, "Major Flood": 23}
@@ -80,7 +81,7 @@ def add_alert_bands(fig, alert_m, ymax=None):
 # --- Page Configuration ---
 st.set_page_config(
     page_title="River Level Forecast",
-    page_icon="🌊",
+    page_icon="��",
     layout="wide"
 )
 
@@ -133,7 +134,7 @@ def update_dataset_if_needed():
         progress_bar.progress(20)
         
         # Run the update script
-        result = subprocess.run(['python', 'update_dataset.py'], 
+        result = subprocess.run([sys.executable, 'update_dataset.py'], 
                               capture_output=True, text=True, timeout=300)
         
         progress_bar.progress(80)
